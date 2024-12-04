@@ -31,10 +31,10 @@ LUAU_FASTFLAGVARIABLE(DebugLuauLogSolver)
 LUAU_FASTFLAGVARIABLE(DebugLuauLogSolverIncludeDependencies)
 LUAU_FASTFLAGVARIABLE(DebugLuauLogBindings)
 LUAU_FASTINTVARIABLE(LuauSolverRecursionLimit, 500)
-LUAU_DYNAMIC_FASTINT(LuauTypeSolverRelease)
 LUAU_FASTFLAGVARIABLE(LuauRemoveNotAnyHack)
 LUAU_FASTFLAGVARIABLE(DebugLuauEqSatSimplification)
 LUAU_FASTFLAG(LuauNewSolverPopulateTableLocations)
+LUAU_FASTFLAGVARIABLE(LuauAllowNilAssignmentToIndexer)
 
 namespace Luau
 {
@@ -919,19 +919,10 @@ bool ConstraintSolver::tryDispatch(const TypeAliasExpansionConstraint& c, NotNul
 
     auto bindResult = [this, &c, constraint](TypeId result)
     {
-        if (DFInt::LuauTypeSolverRelease >= 646)
-        {
-            auto cTarget = follow(c.target);
-            LUAU_ASSERT(get<PendingExpansionType>(cTarget));
-            shiftReferences(cTarget, result);
-            bind(constraint, cTarget, result);
-        }
-        else
-        {
-            LUAU_ASSERT(get<PendingExpansionType>(c.target));
-            shiftReferences(c.target, result);
-            bind(constraint, c.target, result);
-        }
+        auto cTarget = follow(c.target);
+        LUAU_ASSERT(get<PendingExpansionType>(cTarget));
+        shiftReferences(cTarget, result);
+        bind(constraint, cTarget, result);
     };
 
     std::optional<TypeFun> tf = (petv->prefix) ? constraint->scope->lookupImportedType(petv->prefix->value, petv->name.value)
@@ -959,7 +950,7 @@ bool ConstraintSolver::tryDispatch(const TypeAliasExpansionConstraint& c, NotNul
     // Due to how pending expansion types and TypeFun's are created
     // If this check passes, we have created a cyclic / corecursive type alias
     // of size 0
-    TypeId lhs = DFInt::LuauTypeSolverRelease >= 646 ? follow(c.target) : c.target;
+    TypeId lhs = follow(c.target);
     TypeId rhs = tf->type;
     if (occursCheck(lhs, rhs))
     {
@@ -1343,21 +1334,18 @@ bool ConstraintSolver::tryDispatch(const FunctionCheckConstraint& c, NotNull<con
     if (isBlocked(argsPack))
         return true;
 
-    if (DFInt::LuauTypeSolverRelease >= 648)
+    // This is expensive as we need to traverse a (potentially large)
+    // literal up front in order to determine if there are any blocked
+    // types, otherwise we may run `matchTypeLiteral` multiple times,
+    // which right now may fail due to being non-idempotent (it
+    // destructively updates the underlying literal type).
+    auto blockedTypes = findBlockedArgTypesIn(c.callSite, c.astTypes);
+    for (const auto ty : blockedTypes)
     {
-        // This is expensive as we need to traverse a (potentially large)
-        // literal up front in order to determine if there are any blocked
-        // types, otherwise we may run `matchTypeLiteral` multiple times,
-        // which right now may fail due to being non-idempotent (it
-        // destructively updates the underlying literal type).
-        auto blockedTypes = findBlockedArgTypesIn(c.callSite, c.astTypes);
-        for (const auto ty : blockedTypes)
-        {
-            block(ty, constraint);
-        }
-        if (!blockedTypes.empty())
-            return false;
+        block(ty, constraint);
     }
+    if (!blockedTypes.empty())
+        return false;
 
     // We know the type of the function and the arguments it expects to receive.
     // We also know the TypeIds of the actual arguments that will be passed.
@@ -1454,17 +1442,7 @@ bool ConstraintSolver::tryDispatch(const FunctionCheckConstraint& c, NotNull<con
             Unifier2 u2{arena, builtinTypes, constraint->scope, NotNull{&iceReporter}};
             std::vector<TypeId> toBlock;
             (void)matchLiteralType(c.astTypes, c.astExpectedTypes, builtinTypes, arena, NotNull{&u2}, expectedArgTy, actualArgTy, expr, toBlock);
-            if (DFInt::LuauTypeSolverRelease >= 648)
-            {
-                LUAU_ASSERT(toBlock.empty());
-            }
-            else
-            {
-                for (auto t : toBlock)
-                    block(t, constraint);
-                if (!toBlock.empty())
-                    return false;
-            }
+            LUAU_ASSERT(toBlock.empty());
         }
     }
 
@@ -1498,17 +1476,9 @@ bool ConstraintSolver::tryDispatch(const PrimitiveTypeConstraint& c, NotNull<con
     else if (expectedType && maybeSingleton(*expectedType))
         bindTo = freeType->lowerBound;
 
-    if (DFInt::LuauTypeSolverRelease >= 645)
-    {
-        auto ty = follow(c.freeType);
-        shiftReferences(ty, bindTo);
-        bind(constraint, ty, bindTo);
-    }
-    else
-    {
-        shiftReferences(c.freeType, bindTo);
-        bind(constraint, c.freeType, bindTo);
-    }
+    auto ty = follow(c.freeType);
+    shiftReferences(ty, bindTo);
+    bind(constraint, ty, bindTo);
 
     return true;
 }
@@ -1532,7 +1502,8 @@ bool ConstraintSolver::tryDispatch(const HasPropConstraint& c, NotNull<const Con
         }
     }
 
-    auto [blocked, result] = lookupTableProp(constraint, subjectType, c.prop, c.context, c.inConditional, c.suppressSimplification);
+    // It doesn't matter whether this type came from an indexer or not.
+    auto [blocked, result, _isIndex] = lookupTableProp(constraint, subjectType, c.prop, c.context, c.inConditional, c.suppressSimplification);
     if (!blocked.empty())
     {
         for (TypeId blocked : blocked)
@@ -1793,7 +1764,7 @@ bool ConstraintSolver::tryDispatch(const AssignPropConstraint& c, NotNull<const 
 
     if (auto lhsFree = getMutable<FreeType>(lhsType))
     {
-        auto lhsFreeUpperBound = DFInt::LuauTypeSolverRelease >= 648 ? follow(lhsFree->upperBound) : lhsFree->upperBound;
+        auto lhsFreeUpperBound = follow(lhsFree->upperBound);
         if (get<TableType>(lhsFreeUpperBound) || get<MetatableType>(lhsFreeUpperBound))
             lhsType = lhsFreeUpperBound;
         else
@@ -1814,7 +1785,7 @@ bool ConstraintSolver::tryDispatch(const AssignPropConstraint& c, NotNull<const 
 
     // Handle the case that lhsType is a table that already has the property or
     // a matching indexer. This also handles unions and intersections.
-    const auto [blocked, maybeTy] = lookupTableProp(constraint, lhsType, propName, ValueContext::LValue);
+    const auto [blocked, maybeTy, isIndex] = lookupTableProp(constraint, lhsType, propName, ValueContext::LValue);
     if (!blocked.empty())
     {
         for (TypeId t : blocked)
@@ -1824,8 +1795,12 @@ bool ConstraintSolver::tryDispatch(const AssignPropConstraint& c, NotNull<const 
 
     if (maybeTy)
     {
-        const TypeId propTy = *maybeTy;
-        bind(constraint, c.propType, propTy);
+        TypeId propTy = *maybeTy;
+        bind(
+            constraint,
+            c.propType,
+            isIndex && FFlag::LuauAllowNilAssignmentToIndexer ? arena->addType(UnionType{{propTy, builtinTypes->nilType}}) : propTy
+        );
         unify(constraint, rhsType, propTy);
         return true;
     }
@@ -1919,7 +1894,12 @@ bool ConstraintSolver::tryDispatch(const AssignIndexConstraint& c, NotNull<const
         {
             unify(constraint, indexType, lhsTable->indexer->indexType);
             unify(constraint, rhsType, lhsTable->indexer->indexResultType);
-            bind(constraint, c.propType, lhsTable->indexer->indexResultType);
+            bind(
+                constraint,
+                c.propType,
+                FFlag::LuauAllowNilAssignmentToIndexer ? arena->addType(UnionType{{lhsTable->indexer->indexResultType, builtinTypes->nilType}})
+                                                       : lhsTable->indexer->indexResultType
+            );
             return true;
         }
 
@@ -1968,7 +1948,12 @@ bool ConstraintSolver::tryDispatch(const AssignIndexConstraint& c, NotNull<const
             {
                 unify(constraint, indexType, lhsClass->indexer->indexType);
                 unify(constraint, rhsType, lhsClass->indexer->indexResultType);
-                bind(constraint, c.propType, lhsClass->indexer->indexResultType);
+                bind(
+                    constraint,
+                    c.propType,
+                    FFlag::LuauAllowNilAssignmentToIndexer ? arena->addType(UnionType{{lhsClass->indexer->indexResultType, builtinTypes->nilType}})
+                                                           : lhsClass->indexer->indexResultType
+                );
                 return true;
             }
 
@@ -2391,7 +2376,7 @@ NotNull<const Constraint> ConstraintSolver::unpackAndAssign(
     return c;
 }
 
-std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTableProp(
+TablePropLookupResult ConstraintSolver::lookupTableProp(
     NotNull<const Constraint> constraint,
     TypeId subjectType,
     const std::string& propName,
@@ -2404,7 +2389,7 @@ std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTa
     return lookupTableProp(constraint, subjectType, propName, context, inConditional, suppressSimplification, seen);
 }
 
-std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTableProp(
+TablePropLookupResult ConstraintSolver::lookupTableProp(
     NotNull<const Constraint> constraint,
     TypeId subjectType,
     const std::string& propName,
@@ -2444,7 +2429,7 @@ std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTa
         }
 
         if (ttv->indexer && maybeString(ttv->indexer->indexType))
-            return {{}, ttv->indexer->indexResultType};
+            return {{}, ttv->indexer->indexResultType, /* isIndex = */ true};
 
         if (ttv->state == TableState::Free)
         {
@@ -2486,9 +2471,9 @@ std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTa
     }
     else if (auto mt = get<MetatableType>(subjectType); mt && context == ValueContext::RValue)
     {
-        auto [blocked, result] = lookupTableProp(constraint, mt->table, propName, context, inConditional, suppressSimplification, seen);
-        if (!blocked.empty() || result)
-            return {blocked, result};
+        auto result = lookupTableProp(constraint, mt->table, propName, context, inConditional, suppressSimplification, seen);
+        if (!result.blockedTypes.empty() || result.propType)
+            return result;
 
         TypeId mtt = follow(mt->metatable);
 
@@ -2498,7 +2483,7 @@ std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTa
         {
             auto indexProp = metatable->props.find("__index");
             if (indexProp == metatable->props.end())
-                return {{}, result};
+                return {{}, result.propType};
 
             // TODO: __index can be an overloaded function.
 
@@ -2528,7 +2513,7 @@ std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTa
             return {{}, context == ValueContext::RValue ? p->readTy : p->writeTy};
         if (ct->indexer)
         {
-            return {{}, ct->indexer->indexResultType};
+            return {{}, ct->indexer->indexResultType, /* isIndex = */ true};
         }
     }
     else if (auto pt = get<PrimitiveType>(subjectType); pt && pt->metatable)
@@ -2579,10 +2564,10 @@ std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTa
 
         for (TypeId ty : utv)
         {
-            auto [innerBlocked, innerResult] = lookupTableProp(constraint, ty, propName, context, inConditional, suppressSimplification, seen);
-            blocked.insert(blocked.end(), innerBlocked.begin(), innerBlocked.end());
-            if (innerResult)
-                options.insert(*innerResult);
+            auto result = lookupTableProp(constraint, ty, propName, context, inConditional, suppressSimplification, seen);
+            blocked.insert(blocked.end(), result.blockedTypes.begin(), result.blockedTypes.end());
+            if (result.propType)
+                options.insert(*result.propType);
         }
 
         if (!blocked.empty())
@@ -2616,10 +2601,10 @@ std::pair<std::vector<TypeId>, std::optional<TypeId>> ConstraintSolver::lookupTa
 
         for (TypeId ty : itv)
         {
-            auto [innerBlocked, innerResult] = lookupTableProp(constraint, ty, propName, context, inConditional, suppressSimplification, seen);
-            blocked.insert(blocked.end(), innerBlocked.begin(), innerBlocked.end());
-            if (innerResult)
-                options.insert(*innerResult);
+            auto result = lookupTableProp(constraint, ty, propName, context, inConditional, suppressSimplification, seen);
+            blocked.insert(blocked.end(), result.blockedTypes.begin(), result.blockedTypes.end());
+            if (result.propType)
+                options.insert(*result.propType);
         }
 
         if (!blocked.empty())
@@ -2951,7 +2936,7 @@ TypeId ConstraintSolver::resolveModule(const ModuleInfo& info, const Location& l
     }
 
     TypePackId modulePack = module->returnType;
-    if (get<Unifiable::Error>(modulePack))
+    if (get<ErrorTypePack>(modulePack))
         return errorRecoveryType();
 
     std::optional<TypeId> moduleType = first(modulePack);

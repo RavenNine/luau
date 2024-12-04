@@ -21,7 +21,6 @@
 
 LUAU_FASTFLAG(LuauSolverV2)
 LUAU_FASTFLAGVARIABLE(AutocompleteRequirePathSuggestions2)
-LUAU_DYNAMIC_FASTINT(LuauTypeSolverRelease)
 LUAU_FASTINT(LuauTypeInferIterationLimit)
 LUAU_FASTINT(LuauTypeInferRecursionLimit)
 
@@ -1702,7 +1701,7 @@ AutocompleteResult autocomplete_(
     NotNull<BuiltinTypes> builtinTypes,
     TypeArena* typeArena,
     std::vector<AstNode*>& ancestry,
-    Scope* globalScope,
+    Scope* globalScope, // [TODO] This is unused argument, do we really need this?
     const ScopePtr& scopeAtPosition,
     Position position,
     FileResolver* fileResolver,

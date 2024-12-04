@@ -11,6 +11,9 @@
 #include "lstate.h"
 #include "lgc.h"
 
+LUAU_FASTFLAG(LuauVectorLibNativeDot)
+LUAU_FASTFLAG(LuauCodeGenVectorDeadStoreElim)
+
 namespace Luau
 {
 namespace CodeGen
@@ -495,6 +498,13 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         build.str(temp4, AddressA64(addr.base, addr.data + 4));
         build.fcvt(temp4, temp3);
         build.str(temp4, AddressA64(addr.base, addr.data + 8));
+
+        if (FFlag::LuauCodeGenVectorDeadStoreElim && inst.e.kind != IrOpKind::None)
+        {
+            RegisterA64 temp = regs.allocTemp(KindA64::w);
+            build.mov(temp, tagOp(inst.e));
+            build.str(temp, tempAddr(inst.a, offsetof(TValue, tt)));
+        }
         break;
     }
     case IrCmd::STORE_TVALUE:
@@ -730,6 +740,8 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     }
     case IrCmd::DOT_VEC:
     {
+        LUAU_ASSERT(FFlag::LuauVectorLibNativeDot);
+
         inst.regA64 = regs.allocReg(KindA64::d, index);
 
         RegisterA64 temp = regs.allocTemp(KindA64::q);
