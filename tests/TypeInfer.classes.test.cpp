@@ -13,7 +13,8 @@
 using namespace Luau;
 using std::nullopt;
 
-LUAU_FASTFLAG(LuauSolverV2);
+LUAU_FASTFLAG(LuauSolverV2)
+LUAU_FASTFLAG(LuauImproveTypePathsInErrors)
 
 TEST_SUITE_BEGIN("TypeInferClasses");
 
@@ -545,7 +546,13 @@ local b: B = a
 
     LUAU_REQUIRE_ERRORS(result);
 
-    if (FFlag::LuauSolverV2)
+    if (FFlag::LuauSolverV2 && FFlag::LuauImproveTypePathsInErrors)
+        CHECK(
+            "Type 'A' could not be converted into 'B'; \n"
+            "this is because accessing `x` results in `ChildClass` in the former type and `BaseClass` in the latter type, and `ChildClass` is not "
+            "exactly `BaseClass`" == toString(result.errors.at(0))
+        );
+    else if (FFlag::LuauSolverV2)
         CHECK(toString(result.errors.at(0)) == "Type 'A' could not be converted into 'B'; at [read \"x\"], ChildClass is not exactly BaseClass");
     else
     {
@@ -665,12 +672,11 @@ TEST_CASE_FIXTURE(ClassFixture, "indexable_classes")
         )");
 
         if (FFlag::LuauSolverV2)
-            CHECK(
-                "Type 'boolean' could not be converted into 'number | string'" == toString(result.errors.at(0))
-            );
+            CHECK("Type 'boolean' could not be converted into 'number | string'" == toString(result.errors.at(0)));
         else
             CHECK_EQ(
-                toString(result.errors.at(0)), "Type 'boolean' could not be converted into 'number | string'; none of the union options are compatible"
+                toString(result.errors.at(0)),
+                "Type 'boolean' could not be converted into 'number | string'; none of the union options are compatible"
             );
     }
     {
@@ -680,12 +686,11 @@ TEST_CASE_FIXTURE(ClassFixture, "indexable_classes")
         )");
 
         if (FFlag::LuauSolverV2)
-            CHECK(
-                "Type 'boolean' could not be converted into 'number | string'" == toString(result.errors.at(0))
-            );
+            CHECK("Type 'boolean' could not be converted into 'number | string'" == toString(result.errors.at(0)));
         else
             CHECK_EQ(
-                toString(result.errors.at(0)), "Type 'boolean' could not be converted into 'number | string'; none of the union options are compatible"
+                toString(result.errors.at(0)),
+                "Type 'boolean' could not be converted into 'number | string'; none of the union options are compatible"
             );
     }
 

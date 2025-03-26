@@ -7,7 +7,6 @@
 #include "Luau/DcrLogger.h"
 #include "Luau/DenseHash.h"
 #include "Luau/Error.h"
-#include "Luau/InsertionOrderedMap.h"
 #include "Luau/Instantiation.h"
 #include "Luau/Metamethods.h"
 #include "Luau/Normalize.h"
@@ -27,12 +26,13 @@
 #include "Luau/VisitType.h"
 
 #include <algorithm>
-#include <iostream>
-#include <ostream>
+#include <sstream>
 
 LUAU_FASTFLAG(DebugLuauMagicTypes)
 
-LUAU_FASTFLAGVARIABLE(LuauTableKeysAreRValues)
+LUAU_FASTFLAG(LuauFreeTypesMustHaveBounds)
+LUAU_FASTFLAGVARIABLE(LuauImproveTypePathsInErrors)
+LUAU_FASTFLAG(LuauUserTypeFunTypecheck)
 
 namespace Luau
 {
@@ -175,7 +175,7 @@ struct InternalTypeFunctionFinder : TypeOnceVisitor
     DenseHashSet<TypeId> mentionedFunctions{nullptr};
     DenseHashSet<TypePackId> mentionedFunctionPacks{nullptr};
 
-    InternalTypeFunctionFinder(std::vector<TypeId>& declStack)
+    explicit InternalTypeFunctionFinder(std::vector<TypeId>& declStack)
     {
         TypeFunctionFinder f;
         for (TypeId fn : declStack)
@@ -268,6 +268,7 @@ struct InternalTypeFunctionFinder : TypeOnceVisitor
 
 void check(
     NotNull<BuiltinTypes> builtinTypes,
+    NotNull<Simplifier> simplifier,
     NotNull<TypeFunctionRuntime> typeFunctionRuntime,
     NotNull<UnifierSharedState> unifierState,
     NotNull<TypeCheckLimits> limits,
@@ -278,7 +279,7 @@ void check(
 {
     LUAU_TIMETRACE_SCOPE("check", "Typechecking");
 
-    TypeChecker2 typeChecker{builtinTypes, typeFunctionRuntime, unifierState, limits, logger, &sourceModule, module};
+    TypeChecker2 typeChecker{builtinTypes, simplifier, typeFunctionRuntime, unifierState, limits, logger, &sourceModule, module};
 
     typeChecker.visit(sourceModule.root);
 
@@ -295,6 +296,7 @@ void check(
 
 TypeChecker2::TypeChecker2(
     NotNull<BuiltinTypes> builtinTypes,
+    NotNull<Simplifier> simplifier,
     NotNull<TypeFunctionRuntime> typeFunctionRuntime,
     NotNull<UnifierSharedState> unifierState,
     NotNull<TypeCheckLimits> limits,
@@ -303,6 +305,7 @@ TypeChecker2::TypeChecker2(
     Module* module
 )
     : builtinTypes(builtinTypes)
+    , simplifier(simplifier)
     , typeFunctionRuntime(typeFunctionRuntime)
     , logger(logger)
     , limits(limits)
@@ -310,7 +313,7 @@ TypeChecker2::TypeChecker2(
     , sourceModule(sourceModule)
     , module(module)
     , normalizer{&module->internalTypes, builtinTypes, unifierState, /* cacheInhabitance */ true}
-    , _subtyping{builtinTypes, NotNull{&module->internalTypes}, NotNull{&normalizer}, typeFunctionRuntime, NotNull{unifierState->iceHandler}}
+    , _subtyping{builtinTypes, NotNull{&module->internalTypes}, simplifier, NotNull{&normalizer}, typeFunctionRuntime, NotNull{unifierState->iceHandler}}
     , subtyping(&_subtyping)
 {
 }
@@ -492,7 +495,9 @@ TypeId TypeChecker2::checkForTypeFunctionInhabitance(TypeId instance, Location l
         reduceTypeFunctions(
             instance,
             location,
-            TypeFunctionContext{NotNull{&module->internalTypes}, builtinTypes, stack.back(), NotNull{&normalizer}, typeFunctionRuntime, ice, limits},
+            TypeFunctionContext{
+                NotNull{&module->internalTypes}, builtinTypes, stack.back(), simplifier, NotNull{&normalizer}, typeFunctionRuntime, ice, limits
+            },
             true
         )
             .errors;
@@ -501,7 +506,7 @@ TypeId TypeChecker2::checkForTypeFunctionInhabitance(TypeId instance, Location l
     return instance;
 }
 
-TypePackId TypeChecker2::lookupPack(AstExpr* expr)
+TypePackId TypeChecker2::lookupPack(AstExpr* expr) const
 {
     // If a type isn't in the type graph, it probably means that a recursion limit was exceeded.
     // We'll just return anyType in these cases.  Typechecking against any is very fast and this
@@ -551,7 +556,7 @@ TypeId TypeChecker2::lookupAnnotation(AstType* annotation)
     return checkForTypeFunctionInhabitance(follow(*ty), annotation->location);
 }
 
-std::optional<TypePackId> TypeChecker2::lookupPackAnnotation(AstTypePack* annotation)
+std::optional<TypePackId> TypeChecker2::lookupPackAnnotation(AstTypePack* annotation) const
 {
     TypePackId* tp = module->astResolvedTypePacks.find(annotation);
     if (tp != nullptr)
@@ -559,7 +564,7 @@ std::optional<TypePackId> TypeChecker2::lookupPackAnnotation(AstTypePack* annota
     return {};
 }
 
-TypeId TypeChecker2::lookupExpectedType(AstExpr* expr)
+TypeId TypeChecker2::lookupExpectedType(AstExpr* expr) const
 {
     if (TypeId* ty = module->astExpectedTypes.find(expr))
         return follow(*ty);
@@ -567,7 +572,7 @@ TypeId TypeChecker2::lookupExpectedType(AstExpr* expr)
     return builtinTypes->anyType;
 }
 
-TypePackId TypeChecker2::lookupExpectedPack(AstExpr* expr, TypeArena& arena)
+TypePackId TypeChecker2::lookupExpectedPack(AstExpr* expr, TypeArena& arena) const
 {
     if (TypeId* ty = module->astExpectedTypes.find(expr))
         return arena.addTypePack(TypePack{{follow(*ty)}, std::nullopt});
@@ -591,7 +596,7 @@ TypePackId TypeChecker2::reconstructPack(AstArray<AstExpr*> exprs, TypeArena& ar
     return arena.addTypePack(TypePack{head, tail});
 }
 
-Scope* TypeChecker2::findInnermostScope(Location location)
+Scope* TypeChecker2::findInnermostScope(Location location) const
 {
     Scope* bestScope = module->getModuleScope().get();
 
@@ -1014,7 +1019,8 @@ void TypeChecker2::visit(AstStatForIn* forInStatement)
     {
         reportError(OptionalValueAccess{iteratorTy}, forInStatement->values.data[0]->location);
     }
-    else if (std::optional<TypeId> iterMmTy = findMetatableEntry(builtinTypes, module->errors, iteratorTy, "__iter", forInStatement->values.data[0]->location))
+    else if (std::optional<TypeId> iterMmTy =
+                 findMetatableEntry(builtinTypes, module->errors, iteratorTy, "__iter", forInStatement->values.data[0]->location))
     {
         Instantiation instantiation{TxnLog::empty(), &arena, builtinTypes, TypeLevel{}, scope};
 
@@ -1198,7 +1204,8 @@ void TypeChecker2::visit(AstStatTypeAlias* stat)
 
 void TypeChecker2::visit(AstStatTypeFunction* stat)
 {
-    // TODO: add type checking for user-defined type functions
+    if (FFlag::LuauUserTypeFunTypecheck)
+        visit(stat->body);
 }
 
 void TypeChecker2::visit(AstTypeList types)
@@ -1349,7 +1356,17 @@ void TypeChecker2::visit(AstExprGlobal* expr)
 {
     NotNull<Scope> scope = stack.back();
     if (!scope->lookup(expr->name))
+    {
         reportError(UnknownSymbol{expr->name.value, UnknownSymbol::Binding}, expr->location);
+    }
+    else
+    {
+        if (scope->shouldWarnGlobal(expr->name.value) && !warnedGlobals.contains(expr->name.value))
+        {
+            reportError(UnknownSymbol{expr->name.value, UnknownSymbol::Binding}, expr->location);
+            warnedGlobals.insert(expr->name.value);
+        }
+    }
 }
 
 void TypeChecker2::visit(AstExprVarargs* expr)
@@ -1437,10 +1454,11 @@ void TypeChecker2::visitCall(AstExprCall* call)
     TypePackId argsTp = module->internalTypes.addTypePack(args);
     if (auto ftv = get<FunctionType>(follow(*originalCallTy)))
     {
-        if (ftv->dcrMagicTypeCheck)
+        if (ftv->magic)
         {
-            ftv->dcrMagicTypeCheck(MagicFunctionTypeCheckContext{NotNull{this}, builtinTypes, call, argsTp, scope});
-            return;
+            bool usedMagic = ftv->magic->typeCheck(MagicFunctionTypeCheckContext{NotNull{this}, builtinTypes, call, argsTp, scope});
+            if (usedMagic)
+                return;
         }
     }
 
@@ -1448,6 +1466,7 @@ void TypeChecker2::visitCall(AstExprCall* call)
     OverloadResolver resolver{
         builtinTypes,
         NotNull{&module->internalTypes},
+        simplifier,
         NotNull{&normalizer},
         typeFunctionRuntime,
         NotNull{stack.back()},
@@ -1545,7 +1564,7 @@ void TypeChecker2::visit(AstExprCall* call)
     visitCall(call);
 }
 
-std::optional<TypeId> TypeChecker2::tryStripUnionFromNil(TypeId ty)
+std::optional<TypeId> TypeChecker2::tryStripUnionFromNil(TypeId ty) const
 {
     if (const UnionType* utv = get<UnionType>(ty))
     {
@@ -1832,16 +1851,8 @@ void TypeChecker2::visit(AstExprTable* expr)
 {
     for (const AstExprTable::Item& item : expr->items)
     {
-        if (FFlag::LuauTableKeysAreRValues)
-        {
-            if (item.key)
-                visit(item.key, ValueContext::RValue);
-        }
-        else
-        {
-            if (item.key)
-                visit(item.key, ValueContext::LValue);
-        }
+        if (item.key)
+            visit(item.key, ValueContext::RValue);
         visit(item.value, ValueContext::RValue);
     }
 }
@@ -2089,7 +2100,10 @@ TypeId TypeChecker2::visit(AstExprBinary* expr, AstNode* overrideKey)
                 }
                 else
                 {
-                    expectedRets = module->internalTypes.addTypePack({module->internalTypes.freshType(scope, TypeLevel{})});
+                    expectedRets = module->internalTypes.addTypePack(
+                        {FFlag::LuauFreeTypesMustHaveBounds ? module->internalTypes.freshType(builtinTypes, scope, TypeLevel{})
+                                                            : module->internalTypes.freshType_DEPRECATED(scope, TypeLevel{})}
+                    );
                 }
 
                 TypeId expectedTy = module->internalTypes.addType(FunctionType(expectedArgs, expectedRets));
@@ -2341,7 +2355,8 @@ TypeId TypeChecker2::flattenPack(TypePackId pack)
         return *fst;
     else if (auto ftp = get<FreeTypePack>(pack))
     {
-        TypeId result = module->internalTypes.addType(FreeType{ftp->scope});
+        TypeId result = FFlag::LuauFreeTypesMustHaveBounds ? module->internalTypes.freshType(builtinTypes, ftp->scope)
+                                                           : module->internalTypes.addType(FreeType{ftp->scope});
         TypePackId freeTail = module->internalTypes.addTypePack(FreeTypePack{ftp->scope});
 
         TypePack* resultPack = emplaceTypePack<TypePack>(asMutable(pack));
@@ -2358,30 +2373,30 @@ TypeId TypeChecker2::flattenPack(TypePackId pack)
         ice->ice("flattenPack got a weird pack!");
 }
 
-void TypeChecker2::visitGenerics(AstArray<AstGenericType> generics, AstArray<AstGenericTypePack> genericPacks)
+void TypeChecker2::visitGenerics(AstArray<AstGenericType*> generics, AstArray<AstGenericTypePack*> genericPacks)
 {
     DenseHashSet<AstName> seen{AstName{}};
 
-    for (const auto& g : generics)
+    for (const auto* g : generics)
     {
-        if (seen.contains(g.name))
-            reportError(DuplicateGenericParameter{g.name.value}, g.location);
+        if (seen.contains(g->name))
+            reportError(DuplicateGenericParameter{g->name.value}, g->location);
         else
-            seen.insert(g.name);
+            seen.insert(g->name);
 
-        if (g.defaultValue)
-            visit(g.defaultValue);
+        if (g->defaultValue)
+            visit(g->defaultValue);
     }
 
-    for (const auto& g : genericPacks)
+    for (const auto* g : genericPacks)
     {
-        if (seen.contains(g.name))
-            reportError(DuplicateGenericParameter{g.name.value}, g.location);
+        if (seen.contains(g->name))
+            reportError(DuplicateGenericParameter{g->name.value}, g->location);
         else
-            seen.insert(g.name);
+            seen.insert(g->name);
 
-        if (g.defaultValue)
-            visit(g.defaultValue);
+        if (g->defaultValue)
+            visit(g->defaultValue);
     }
 }
 
@@ -2403,6 +2418,8 @@ void TypeChecker2::visit(AstType* ty)
         return visit(t);
     else if (auto t = ty->as<AstTypeIntersection>())
         return visit(t);
+    else if (auto t = ty->as<AstTypeGroup>())
+        return visit(t->type);
 }
 
 void TypeChecker2::visit(AstTypeReference* ty)
@@ -2688,20 +2705,61 @@ Reasonings TypeChecker2::explainReasonings_(TID subTy, TID superTy, Location loc
         if (!subLeafTy && !superLeafTy && !subLeafTp && !superLeafTp)
             ice->ice("Subtyping test returned a reasoning where one path ends at a type and the other ends at a pack.", location);
 
-        std::string relation = "a subtype of";
-        if (reasoning.variance == SubtypingVariance::Invariant)
-            relation = "exactly";
-        else if (reasoning.variance == SubtypingVariance::Contravariant)
-            relation = "a supertype of";
+        if (FFlag::LuauImproveTypePathsInErrors)
+        {
+            std::string relation = "a subtype of";
+            if (reasoning.variance == SubtypingVariance::Invariant)
+                relation = "exactly";
+            else if (reasoning.variance == SubtypingVariance::Contravariant)
+                relation = "a supertype of";
 
-        std::string reason;
-        if (reasoning.subPath == reasoning.superPath)
-            reason = "at " + toString(reasoning.subPath) + ", " + toString(subLeaf) + " is not " + relation + " " + toString(superLeaf);
+            std::string subLeafAsString = toString(subLeaf);
+            // if the string is empty, it must be an empty type pack
+            if (subLeafAsString.empty())
+                subLeafAsString = "()";
+
+            std::string superLeafAsString = toString(superLeaf);
+            // if the string is empty, it must be an empty type pack
+            if (superLeafAsString.empty())
+                superLeafAsString = "()";
+
+            std::stringstream baseReasonBuilder;
+            baseReasonBuilder << "`" << subLeafAsString << "` is not " << relation << " `" << superLeafAsString << "`";
+            std::string baseReason = baseReasonBuilder.str();
+
+            std::stringstream reason;
+
+            if (reasoning.subPath == reasoning.superPath)
+                reason << toStringHuman(reasoning.subPath) << "`" << subLeafAsString << "` in the former type and `" << superLeafAsString
+                       << "` in the latter type, and " << baseReason;
+            else if (!reasoning.subPath.empty() && !reasoning.superPath.empty())
+                reason << toStringHuman(reasoning.subPath) << "`" << subLeafAsString << "` and " << toStringHuman(reasoning.superPath) << "`"
+                       << superLeafAsString << "`, and " << baseReason;
+            else if (!reasoning.subPath.empty())
+                reason << toStringHuman(reasoning.subPath) << "`" << subLeafAsString << "`, which is not " << relation << " `" << superLeafAsString
+                       << "`";
+            else
+                reason << toStringHuman(reasoning.superPath) << "`" << superLeafAsString << "`, and " << baseReason;
+
+            reasons.push_back(reason.str());
+        }
         else
-            reason = "type " + toString(subTy) + toString(reasoning.subPath, /* prefixDot */ true) + " (" + toString(subLeaf) + ") is not " +
-                     relation + " " + toString(superTy) + toString(reasoning.superPath, /* prefixDot */ true) + " (" + toString(superLeaf) + ")";
+        {
+            std::string relation = "a subtype of";
+            if (reasoning.variance == SubtypingVariance::Invariant)
+                relation = "exactly";
+            else if (reasoning.variance == SubtypingVariance::Contravariant)
+                relation = "a supertype of";
 
-        reasons.push_back(reason);
+            std::string reason;
+            if (reasoning.subPath == reasoning.superPath)
+                reason = "at " + toString(reasoning.subPath) + ", " + toString(subLeaf) + " is not " + relation + " " + toString(superLeaf);
+            else
+                reason = "type " + toString(subTy) + toString(reasoning.subPath, /* prefixDot */ true) + " (" + toString(subLeaf) + ") is not " +
+                         relation + " " + toString(superTy) + toString(reasoning.superPath, /* prefixDot */ true) + " (" + toString(superLeaf) + ")";
+
+            reasons.push_back(reason);
+        }
 
         // if we haven't already proved this isn't suppressing, we have to keep checking.
         if (suppressed)
@@ -3024,7 +3082,7 @@ PropertyType TypeChecker2::hasIndexTypeFromType(
         {
             TypeId indexType = follow(tt->indexer->indexType);
             TypeId givenType = module->internalTypes.addType(SingletonType{StringSingleton{prop}});
-            if (isSubtype(givenType, indexType, NotNull{module->getModuleScope().get()}, builtinTypes, *ice))
+            if (isSubtype(givenType, indexType, NotNull{module->getModuleScope().get()}, builtinTypes, simplifier, *ice))
                 return {NormalizationResult::True, {tt->indexer->indexResultType}};
         }
 

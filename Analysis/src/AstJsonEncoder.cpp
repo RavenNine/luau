@@ -1065,6 +1065,11 @@ struct AstJsonEncoder : public AstVisitor
         );
     }
 
+    void write(class AstTypeOptional* node)
+    {
+        writeNode(node, "AstTypeOptional", [&]() {});
+    }
+
     void write(class AstTypeUnion* node)
     {
         writeNode(
@@ -1159,6 +1164,19 @@ struct AstJsonEncoder : public AstVisitor
                 write("name", node->type);
             }
         );
+    }
+
+    bool visit(class AstTypeGroup* node) override
+    {
+        writeNode(
+            node,
+            "AstTypeGroup",
+            [&]()
+            {
+                write("inner", node->type);
+            }
+        );
+        return false;
     }
 
     bool visit(class AstTypeSingletonBool* node) override

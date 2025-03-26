@@ -3,7 +3,7 @@
 #include "Luau/Constraint.h"
 #include "Luau/VisitType.h"
 
-LUAU_FASTFLAGVARIABLE(LuauDontRefCountTypesInTypeFunctions)
+LUAU_FASTFLAG(DebugLuauGreedyGeneralization)
 
 namespace Luau
 {
@@ -60,9 +60,8 @@ struct ReferenceCountInitializer : TypeOnceVisitor
         //
         // The default behavior here is `true` for "visit the child types"
         // of this type, hence:
-        return !FFlag::LuauDontRefCountTypesInTypeFunctions;
+        return false;
     }
-
 };
 
 bool isReferenceCountedType(const TypeId typ)
@@ -114,6 +113,11 @@ DenseHashSet<TypeId> Constraint::getMaybeMutatedFreeTypes() const
     {
         rci.traverse(fchc->argsPack);
     }
+    else if (auto fcc = get<FunctionCallConstraint>(*this); fcc && FFlag::DebugLuauGreedyGeneralization)
+    {
+        rci.traverse(fcc->fn);
+        rci.traverse(fcc->argsPack);
+    }
     else if (auto ptc = get<PrimitiveTypeConstraint>(*this))
     {
         rci.traverse(ptc->freeType);
@@ -121,7 +125,8 @@ DenseHashSet<TypeId> Constraint::getMaybeMutatedFreeTypes() const
     else if (auto hpc = get<HasPropConstraint>(*this))
     {
         rci.traverse(hpc->resultType);
-        // `HasPropConstraints` should not mutate `subjectType`.
+        if (FFlag::DebugLuauGreedyGeneralization)
+            rci.traverse(hpc->subjectType);
     }
     else if (auto hic = get<HasIndexerConstraint>(*this))
     {
@@ -148,6 +153,10 @@ DenseHashSet<TypeId> Constraint::getMaybeMutatedFreeTypes() const
     else if (auto rpc = get<ReducePackConstraint>(*this))
     {
         rci.traverse(rpc->tp);
+    }
+    else if (auto tcc = get<TableCheckConstraint>(*this))
+    {
+        rci.traverse(tcc->exprType);
     }
 
     return types;

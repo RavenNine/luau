@@ -2,6 +2,7 @@
 
 #include "Fixture.h"
 
+#include "ScopedFlags.h"
 #include "doctest.h"
 #include "Luau/BuiltinDefinitions.h"
 #include "Luau/AstQuery.h"
@@ -9,7 +10,8 @@
 using namespace Luau;
 
 LUAU_FASTFLAG(LuauSolverV2)
-LUAU_FASTFLAG(LuauUserDefinedTypeFunctionsSyntax2)
+LUAU_FASTFLAG(LuauFixInfiniteRecursionInNormalization)
+LUAU_FASTFLAG(LuauImproveTypePathsInErrors)
 
 TEST_SUITE_BEGIN("TypeAliases");
 
@@ -215,7 +217,11 @@ TEST_CASE_FIXTURE(Fixture, "generic_aliases")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type '{ v: string }' could not be converted into 'T<number>'; at [read "v"], string is not exactly number)";
+    const std::string expected = (FFlag::LuauImproveTypePathsInErrors)
+                                     ? "Type '{ v: string }' could not be converted into 'T<number>'; \n"
+                                       "this is because accessing `v` results in `string` in the former type and `number` in the latter type, and "
+                                       "`string` is not exactly `number`"
+                                     : R"(Type '{ v: string }' could not be converted into 'T<number>'; at [read "v"], string is not exactly number)";
     CHECK(result.errors[0].location == Location{{4, 31}, {4, 44}});
     CHECK_EQ(expected, toString(result.errors[0]));
 }
@@ -235,7 +241,11 @@ TEST_CASE_FIXTURE(Fixture, "dependent_generic_aliases")
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
     const std::string expected =
-        R"(Type '{ t: { v: string } }' could not be converted into 'U<number>'; at [read "t"][read "v"], string is not exactly number)";
+        (FFlag::LuauImproveTypePathsInErrors)
+            ? "Type '{ t: { v: string } }' could not be converted into 'U<number>'; \n"
+              "this is because accessing `t.v` results in `string` in the former type and `number` in the latter type, and `string` is not exactly "
+              "`number`"
+            : R"(Type '{ t: { v: string } }' could not be converted into 'U<number>'; at [read "t"][read "v"], string is not exactly number)";
 
     CHECK(result.errors[0].location == Location{{4, 31}, {4, 52}});
     CHECK_EQ(expected, toString(result.errors[0]));
@@ -1177,6 +1187,35 @@ TEST_CASE_FIXTURE(Fixture, "bound_type_in_alias_segfault")
         export type FieldConfig<TSource, TContext, TArgs> = {[ string]: any}
         export type FieldConfigMap<TSource, TContext> = Map<string, FieldConfig<TSource, TContext>>
     )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "gh1632_no_infinite_recursion_in_normalization")
+{
+    ScopedFastFlag flags[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauFixInfiniteRecursionInNormalization, true},
+    };
+
+    CheckResult result = check(R"(
+        type Node<T> = {
+            value: T,
+            next: Node<T>?,
+            -- remove `prev`, solves issue
+            prev: Node<T>?,
+        };
+
+        type List<T> = {
+            head: Node<T>?
+        }
+
+        local function IsFront(list: List<any>, nodeB: Node<any>)
+            -- remove if statement below, solves issue
+            if (list.head == nodeB) then
+            end
+        end
+    )");
+
+    LUAU_CHECK_NO_ERRORS(result);
 }
 
 TEST_SUITE_END();

@@ -9,7 +9,8 @@ using std::nullopt;
 namespace Luau
 {
 
-ClassFixture::ClassFixture()
+ClassFixture::ClassFixture(bool prepareAutocomplete)
+    : BuiltinsFixture(prepareAutocomplete)
 {
     GlobalTypes& globals = frontend.globals;
     TypeArena& arena = globals.globalTypes;
@@ -131,6 +132,15 @@ ClassFixture::ClassFixture()
     addIndexableClass("IndexableClass", arena.addType(Luau::UnionType{{stringType, numberType}}), numberType);
     // IndexableNumericKeyClass has a table indexer with a key type of 'number' and a return type of 'number'
     addIndexableClass("IndexableNumericKeyClass", numberType, numberType);
+
+    // Add a confusing derived class which shares the same name internally, but has a unique alias
+    TypeId duplicateBaseClassInstanceType = arena.addType(ClassType{"BaseClass", {}, baseClassInstanceType, nullopt, {}, {}, "Test", {}});
+
+    getMutable<ClassType>(duplicateBaseClassInstanceType)->props = {
+        {"Method", {makeFunction(arena, duplicateBaseClassInstanceType, {}, {stringType})}},
+    };
+
+    addGlobalBinding(globals, "confusingBaseClassInstance", duplicateBaseClassInstanceType, "@test");
 
     for (const auto& [name, tf] : globals.globalScope->exportedTypeBindings)
         persist(tf.type);

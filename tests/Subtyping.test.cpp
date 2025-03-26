@@ -15,7 +15,8 @@
 
 #include <initializer_list>
 
-LUAU_FASTFLAG(LuauSolverV2);
+LUAU_FASTFLAG(LuauSolverV2)
+LUAU_FASTFLAG(LuauNormalizedBufferIsNotUnknown)
 
 using namespace Luau;
 
@@ -65,6 +66,7 @@ struct SubtypeFixture : Fixture
     TypeArena arena;
     InternalErrorReporter iceReporter;
     UnifierSharedState sharedState{&ice};
+    SimplifierPtr simplifier = newSimplifier(NotNull{&arena}, builtinTypes);
     Normalizer normalizer{&arena, builtinTypes, NotNull{&sharedState}};
     TypeCheckLimits limits;
     TypeFunctionRuntime typeFunctionRuntime{NotNull{&iceReporter}, NotNull{&limits}};
@@ -79,7 +81,9 @@ struct SubtypeFixture : Fixture
 
     Subtyping mkSubtyping()
     {
-        return Subtyping{builtinTypes, NotNull{&arena}, NotNull{&normalizer}, NotNull{&typeFunctionRuntime}, NotNull{&iceReporter}};
+        return Subtyping{
+            builtinTypes, NotNull{&arena}, NotNull{simplifier.get()}, NotNull{&normalizer}, NotNull{&typeFunctionRuntime}, NotNull{&iceReporter}
+        };
     }
 
     TypePackId pack(std::initializer_list<TypeId> tys)
@@ -957,6 +961,20 @@ TEST_IS_NOT_SUBTYPE(rootClass, negate(builtinTypes->classType));
 TEST_IS_NOT_SUBTYPE(childClass, negate(rootClass));
 TEST_IS_NOT_SUBTYPE(childClass, meet(builtinTypes->classType, negate(rootClass)));
 TEST_IS_SUBTYPE(anotherChildClass, meet(builtinTypes->classType, negate(childClass)));
+
+// Negated primitives against unknown
+TEST_IS_NOT_SUBTYPE(builtinTypes->unknownType, negate(builtinTypes->booleanType));
+TEST_IS_NOT_SUBTYPE(builtinTypes->unknownType, negate(builtinTypes->numberType));
+TEST_IS_NOT_SUBTYPE(builtinTypes->unknownType, negate(builtinTypes->stringType));
+TEST_IS_NOT_SUBTYPE(builtinTypes->unknownType, negate(builtinTypes->threadType));
+
+TEST_CASE_FIXTURE(SubtypeFixture, "unknown <!: ~buffer")
+{
+    // TODO: replace with TEST_IS_NOT_SUBTYPE on flag removal
+    ScopedFastFlag luauNormalizedBufferIsNotUnknown{FFlag::LuauNormalizedBufferIsNotUnknown, true};
+
+    CHECK_IS_NOT_SUBTYPE(builtinTypes->unknownType, negate(builtinTypes->bufferType));
+}
 
 TEST_CASE_FIXTURE(SubtypeFixture, "Root <: class")
 {

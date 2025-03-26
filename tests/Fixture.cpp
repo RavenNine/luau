@@ -5,6 +5,7 @@
 #include "Luau/BuiltinDefinitions.h"
 #include "Luau/Common.h"
 #include "Luau/Constraint.h"
+#include "Luau/FileResolver.h"
 #include "Luau/ModuleResolver.h"
 #include "Luau/NotNull.h"
 #include "Luau/Parser.h"
@@ -33,6 +34,110 @@ extern std::optional<unsigned> randomSeed; // tests/main.cpp
 
 namespace Luau
 {
+
+static std::string getNodeName(const TestRequireNode* node)
+{
+    std::string name;
+    size_t lastSlash = node->moduleName.find_last_of('/');
+    if (lastSlash != std::string::npos)
+        name = node->moduleName.substr(lastSlash + 1);
+    else
+        name = node->moduleName;
+
+    return name;
+}
+
+std::string TestRequireNode::getLabel() const
+{
+    return getNodeName(this);
+}
+
+std::string TestRequireNode::getPathComponent() const
+{
+    return getNodeName(this);
+}
+
+static std::vector<std::string_view> splitStringBySlashes(std::string_view str)
+{
+    std::vector<std::string_view> components;
+    size_t pos = 0;
+    size_t nextPos = str.find_first_of('/', pos);
+    if (nextPos == std::string::npos)
+    {
+        components.push_back(str);
+        return components;
+    }
+    while (nextPos != std::string::npos)
+    {
+        components.push_back(str.substr(pos, nextPos - pos));
+        pos = nextPos + 1;
+        nextPos = str.find_first_of('/', pos);
+    }
+    components.push_back(str.substr(pos));
+    return components;
+}
+
+std::unique_ptr<RequireNode> TestRequireNode::resolvePathToNode(const std::string& path) const
+{
+    std::vector<std::string_view> components = splitStringBySlashes(path);
+    LUAU_ASSERT((components.empty() || components[0] == "." || components[0] == "..") && "Path must begin with ./ or ../ in test");
+
+    std::vector<std::string_view> normalizedComponents = splitStringBySlashes(moduleName);
+    normalizedComponents.pop_back();
+    LUAU_ASSERT(!normalizedComponents.empty() && "Must have a root module");
+
+    for (std::string_view component : components)
+    {
+        if (component == "..")
+        {
+            if (normalizedComponents.empty())
+                LUAU_ASSERT(!"Cannot go above root module in test");
+            else
+                normalizedComponents.pop_back();
+        }
+        else if (!component.empty() && component != ".")
+        {
+            normalizedComponents.emplace_back(component);
+        }
+    }
+
+    std::string moduleName;
+    for (size_t i = 0; i < normalizedComponents.size(); i++)
+    {
+        if (i > 0)
+            moduleName += '/';
+        moduleName += normalizedComponents[i];
+    }
+
+    if (allSources->count(moduleName) == 0)
+        return nullptr;
+
+    return std::make_unique<TestRequireNode>(moduleName, allSources);
+}
+
+std::vector<std::unique_ptr<RequireNode>> TestRequireNode::getChildren() const
+{
+    std::vector<std::unique_ptr<RequireNode>> result;
+    for (const auto& entry : *allSources)
+    {
+        if (std::string_view(entry.first).substr(0, moduleName.size()) == moduleName && entry.first.size() > moduleName.size() &&
+            entry.first[moduleName.size()] == '/' && entry.first.find('/', moduleName.size() + 1) == std::string::npos)
+        {
+            result.push_back(std::make_unique<TestRequireNode>(entry.first, allSources));
+        }
+    }
+    return result;
+}
+
+std::vector<RequireAlias> TestRequireNode::getAvailableAliases() const
+{
+    return {{"defaultalias"}};
+}
+
+std::unique_ptr<RequireNode> TestRequireSuggester::getNode(const ModuleName& name) const
+{
+    return std::make_unique<TestRequireNode>(name, &resolver->source);
+}
 
 std::optional<ModuleInfo> TestFileResolver::resolveModuleInfo(const ModuleName& currentModuleName, const AstExpr& pathExpr)
 {
@@ -218,6 +323,7 @@ AstStatBlock* Fixture::parse(const std::string& source, const ParseOptions& pars
                     NotNull{&moduleResolver},
                     NotNull{&fileResolver},
                     frontend.globals.globalScope,
+                    frontend.globals.globalTypeFunctionScope,
                     /*prepareModuleScope*/ nullptr,
                     frontend.options,
                     {},
@@ -341,8 +447,11 @@ ParseResult Fixture::matchParseErrorPrefix(const std::string& source, const std:
     return result;
 }
 
-ModulePtr Fixture::getMainModule()
+ModulePtr Fixture::getMainModule(bool forAutocomplete)
 {
+    if (forAutocomplete && !FFlag::LuauSolverV2)
+        return frontend.moduleResolverForAutocomplete.getModule(fromString(mainModuleName));
+
     return frontend.moduleResolver.getModule(fromString(mainModuleName));
 }
 
@@ -365,9 +474,9 @@ std::optional<PrimitiveType::Type> Fixture::getPrimitiveType(TypeId ty)
         return std::nullopt;
 }
 
-std::optional<TypeId> Fixture::getType(const std::string& name)
+std::optional<TypeId> Fixture::getType(const std::string& name, bool forAutocomplete)
 {
-    ModulePtr module = getMainModule();
+    ModulePtr module = getMainModule(forAutocomplete);
     REQUIRE(module);
 
     if (!module->hasModuleScope())
@@ -519,6 +628,9 @@ void Fixture::registerTestTypes()
 
 void Fixture::dumpErrors(const CheckResult& cr)
 {
+    if (hasDumpedErrors)
+        return;
+    hasDumpedErrors = true;
     std::string error = getErrors(cr);
     if (!error.empty())
         MESSAGE(error);
@@ -526,6 +638,9 @@ void Fixture::dumpErrors(const CheckResult& cr)
 
 void Fixture::dumpErrors(const ModulePtr& module)
 {
+    if (hasDumpedErrors)
+        return;
+    hasDumpedErrors = true;
     std::stringstream ss;
     dumpErrors(ss, module->errors);
     if (!ss.str().empty())
@@ -534,6 +649,9 @@ void Fixture::dumpErrors(const ModulePtr& module)
 
 void Fixture::dumpErrors(const Module& module)
 {
+    if (hasDumpedErrors)
+        return;
+    hasDumpedErrors = true;
     std::stringstream ss;
     dumpErrors(ss, module.errors);
     if (!ss.str().empty())

@@ -12,8 +12,7 @@
 
 LUAU_FASTFLAG(LuauInstantiateInSubtyping)
 LUAU_FASTFLAG(LuauSolverV2)
-LUAU_FASTFLAG(LuauTypestateBuiltins2)
-LUAU_FASTFLAG(LuauNewSolverPopulateTableLocations)
+LUAU_FASTFLAG(LuauImproveTypePathsInErrors)
 
 using namespace Luau;
 
@@ -185,10 +184,8 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "cross_module_table_freeze")
     ModulePtr b = frontend.moduleResolver.getModule("game/B");
     REQUIRE(b != nullptr);
     // confirm that no cross-module mutation happened here!
-    if (FFlag::LuauSolverV2 && FFlag::LuauTypestateBuiltins2)
+    if (FFlag::LuauSolverV2)
         CHECK(toString(b->returnType) == "{ read a: number }");
-    else if (FFlag::LuauSolverV2)
-        CHECK(toString(b->returnType) == "{ a: number }");
     else
         CHECK(toString(b->returnType) == "{| a: number |}");
 }
@@ -465,15 +462,19 @@ local b: B.T = a
     CheckResult result = frontend.check("game/C");
     LUAU_REQUIRE_ERROR_COUNT(1, result);
 
-    if (FFlag::LuauSolverV2)
+    if (FFlag::LuauSolverV2 && FFlag::LuauImproveTypePathsInErrors)
     {
-        if (FFlag::LuauNewSolverPopulateTableLocations)
-            CHECK(
-                toString(result.errors.at(0)) ==
-                "Type 'T' from 'game/A' could not be converted into 'T' from 'game/B'; at [read \"x\"], number is not exactly string"
-            );
-        else
-            CHECK(toString(result.errors.at(0)) == "Type 'T' could not be converted into 'T'; at [read \"x\"], number is not exactly string");
+        const std::string expected = "Type 'T' from 'game/A' could not be converted into 'T' from 'game/B'; \n"
+                                     "this is because accessing `x` results in `number` in the former type and `string` in the latter type, and "
+                                     "`number` is not exactly `string`";
+        CHECK(expected == toString(result.errors[0]));
+    }
+    else if (FFlag::LuauSolverV2)
+    {
+        CHECK(
+            toString(result.errors.at(0)) ==
+            "Type 'T' from 'game/A' could not be converted into 'T' from 'game/B'; at [read \"x\"], number is not exactly string"
+        );
     }
     else
     {
@@ -514,15 +515,19 @@ local b: B.T = a
     CheckResult result = frontend.check("game/D");
     LUAU_REQUIRE_ERROR_COUNT(1, result);
 
-    if (FFlag::LuauSolverV2)
+    if (FFlag::LuauSolverV2 && FFlag::LuauImproveTypePathsInErrors)
     {
-        if (FFlag::LuauNewSolverPopulateTableLocations)
-            CHECK(
-                toString(result.errors.at(0)) ==
-                "Type 'T' from 'game/B' could not be converted into 'T' from 'game/C'; at [read \"x\"], number is not exactly string"
-            );
-        else
-            CHECK(toString(result.errors.at(0)) == "Type 'T' could not be converted into 'T'; at [read \"x\"], number is not exactly string");
+        const std::string expected = "Type 'T' from 'game/B' could not be converted into 'T' from 'game/C'; \n"
+                                     "this is because accessing `x` results in `number` in the former type and `string` in the latter type, and "
+                                     "`number` is not exactly `string`";
+        CHECK(expected == toString(result.errors[0]));
+    }
+    else if (FFlag::LuauSolverV2)
+    {
+        CHECK(
+            toString(result.errors.at(0)) ==
+            "Type 'T' from 'game/B' could not be converted into 'T' from 'game/C'; at [read \"x\"], number is not exactly string"
+        );
     }
     else
     {

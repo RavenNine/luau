@@ -13,7 +13,6 @@
 
 LUAU_FASTFLAG(DebugLuauFreezeArena)
 LUAU_FASTFLAG(LuauSolverV2)
-LUAU_FASTFLAG(LuauTypestateBuiltins2)
 
 namespace Luau
 {
@@ -60,6 +59,12 @@ const RefinementKey* RefinementKeyArena::leaf(DefId def)
 const RefinementKey* RefinementKeyArena::node(const RefinementKey* parent, DefId def, const std::string& propName)
 {
     return allocator.allocate(RefinementKey{parent, def, propName});
+}
+
+DataFlowGraph::DataFlowGraph(NotNull<DefArena> defArena, NotNull<RefinementKeyArena> keyArena)
+    : defArena{defArena}
+    , keyArena{keyArena}
+{
 }
 
 DefId DataFlowGraph::getDef(const AstExpr* expr) const
@@ -178,11 +183,23 @@ bool DfgScope::canUpdateDefinition(DefId def, const std::string& key) const
     return true;
 }
 
-DataFlowGraph DataFlowGraphBuilder::build(AstStatBlock* block, NotNull<InternalErrorReporter> handle)
+DataFlowGraphBuilder::DataFlowGraphBuilder(NotNull<DefArena> defArena, NotNull<RefinementKeyArena> keyArena)
+    : graph{defArena, keyArena}
+    , defArena{defArena}
+    , keyArena{keyArena}
+{
+}
+
+DataFlowGraph DataFlowGraphBuilder::build(
+    AstStatBlock* block,
+    NotNull<DefArena> defArena,
+    NotNull<RefinementKeyArena> keyArena,
+    NotNull<struct InternalErrorReporter> handle
+)
 {
     LUAU_TIMETRACE_SCOPE("DataFlowGraphBuilder::build", "Typechecking");
 
-    DataFlowGraphBuilder builder;
+    DataFlowGraphBuilder builder(defArena, keyArena);
     builder.handle = handle;
     DfgScope* moduleScope = builder.makeChildScope();
     PushScope ps{builder.scopeStack, moduleScope};
@@ -196,30 +213,6 @@ DataFlowGraph DataFlowGraphBuilder::build(AstStatBlock* block, NotNull<InternalE
     }
 
     return std::move(builder.graph);
-}
-
-std::pair<std::shared_ptr<DataFlowGraph>, std::vector<std::unique_ptr<DfgScope>>> DataFlowGraphBuilder::buildShared(
-    AstStatBlock* block,
-    NotNull<InternalErrorReporter> handle
-)
-{
-
-    LUAU_TIMETRACE_SCOPE("DataFlowGraphBuilder::build", "Typechecking");
-
-    DataFlowGraphBuilder builder;
-    builder.handle = handle;
-    DfgScope* moduleScope = builder.makeChildScope();
-    PushScope ps{builder.scopeStack, moduleScope};
-    builder.visitBlockWithoutChildScope(block);
-    builder.resolveCaptures();
-
-    if (FFlag::DebugLuauFreezeArena)
-    {
-        builder.defArena->allocator.freeze();
-        builder.keyArena->allocator.freeze();
-    }
-
-    return {std::make_shared<DataFlowGraph>(std::move(builder.graph)), std::move(builder.scopes)};
 }
 
 void DataFlowGraphBuilder::resolveCaptures()
@@ -885,7 +878,7 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprCall* c)
 {
     visitExpr(c->func);
 
-    if (FFlag::LuauTypestateBuiltins2 && shouldTypestateForFirstArgument(*c) && c->args.size > 1 && isLValue(*c->args.begin()))
+    if (shouldTypestateForFirstArgument(*c) && c->args.size > 1 && isLValue(*c->args.begin()))
     {
         AstExpr* firstArg = *c->args.begin();
 
@@ -918,8 +911,17 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprCall* c)
     for (AstExpr* arg : c->args)
         visitExpr(arg);
 
-    // calls should be treated as subscripted.
-    return {defArena->freshCell(/* subscripted */ true), nullptr};
+    // We treat function calls as "subscripted" as they could potentially
+    // return a subscripted value, consider:
+    //
+    //  local function foo(tbl: {[string]: woof)
+    //      return tbl["foobarbaz"]
+    //  end
+    //
+    //  local v = foo({})
+    //
+    // We want to consider `v` to be subscripted here.
+    return {defArena->freshCell(/*subscripted=*/true)};
 }
 
 DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprIndexName* i)
@@ -1166,6 +1168,8 @@ void DataFlowGraphBuilder::visitType(AstType* t)
         return visitType(f);
     else if (auto tyof = t->as<AstTypeTypeof>())
         return visitType(tyof);
+    else if (auto o = t->as<AstTypeOptional>())
+        return;
     else if (auto u = t->as<AstTypeUnion>())
         return visitType(u);
     else if (auto i = t->as<AstTypeIntersection>())
@@ -1176,6 +1180,8 @@ void DataFlowGraphBuilder::visitType(AstType* t)
         return; // ok
     else if (auto s = t->as<AstTypeSingletonString>())
         return; // ok
+    else if (auto g = t->as<AstTypeGroup>())
+        return visitType(g->type);
     else
         handle->ice("Unknown AstType in DataFlowGraphBuilder::visitType");
 }
@@ -1265,21 +1271,21 @@ void DataFlowGraphBuilder::visitTypeList(AstTypeList l)
         visitTypePack(l.tailType);
 }
 
-void DataFlowGraphBuilder::visitGenerics(AstArray<AstGenericType> g)
+void DataFlowGraphBuilder::visitGenerics(AstArray<AstGenericType*> g)
 {
-    for (AstGenericType generic : g)
+    for (AstGenericType* generic : g)
     {
-        if (generic.defaultValue)
-            visitType(generic.defaultValue);
+        if (generic->defaultValue)
+            visitType(generic->defaultValue);
     }
 }
 
-void DataFlowGraphBuilder::visitGenericPacks(AstArray<AstGenericTypePack> g)
+void DataFlowGraphBuilder::visitGenericPacks(AstArray<AstGenericTypePack*> g)
 {
-    for (AstGenericTypePack generic : g)
+    for (AstGenericTypePack* generic : g)
     {
-        if (generic.defaultValue)
-            visitTypePack(generic.defaultValue);
+        if (generic->defaultValue)
+            visitTypePack(generic->defaultValue);
     }
 }
 

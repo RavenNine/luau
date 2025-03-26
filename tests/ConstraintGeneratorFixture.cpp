@@ -22,7 +22,9 @@ ConstraintGeneratorFixture::ConstraintGeneratorFixture()
 void ConstraintGeneratorFixture::generateConstraints(const std::string& code)
 {
     AstStatBlock* root = parse(code);
-    dfg = std::make_unique<DataFlowGraph>(DataFlowGraphBuilder::build(root, NotNull{&ice}));
+    dfg = std::make_unique<DataFlowGraph>(
+        DataFlowGraphBuilder::build(root, NotNull{&mainModule->defArena}, NotNull{&mainModule->keyArena}, NotNull{&ice})
+    );
     cg = std::make_unique<ConstraintGenerator>(
         mainModule,
         NotNull{&normalizer},
@@ -32,6 +34,7 @@ void ConstraintGeneratorFixture::generateConstraints(const std::string& code)
         builtinTypes,
         NotNull(&ice),
         frontend.globals.globalScope,
+        frontend.globals.globalTypeFunctionScope,
         /*prepareModuleScope*/ nullptr,
         &logger,
         NotNull{dfg.get()},
@@ -51,6 +54,7 @@ void ConstraintGeneratorFixture::solve(const std::string& code)
         NotNull{&typeFunctionRuntime},
         NotNull{rootScope},
         constraints,
+        NotNull{&cg->scopeToFunction},
         "MainModule",
         NotNull(&moduleResolver),
         {},

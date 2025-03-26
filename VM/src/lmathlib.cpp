@@ -7,8 +7,6 @@
 #include <math.h>
 #include <time.h>
 
-LUAU_FASTFLAGVARIABLE(LuauMathMap)
-
 #undef PI
 #define PI (3.14159265358979323846)
 #define RADIANS_PER_DEGREE (PI / 180.0)
@@ -418,6 +416,17 @@ static int math_map(lua_State* L)
     return 1;
 }
 
+static int math_lerp(lua_State* L)
+{
+    double a = luaL_checknumber(L, 1);
+    double b = luaL_checknumber(L, 2);
+    double t = luaL_checknumber(L, 3);
+
+    double r = (t == 1.0) ? b : a + (b - a) * t;
+    lua_pushnumber(L, r);
+    return 1;
+}
+
 static const luaL_Reg mathlib[] = {
     {"abs", math_abs},
     {"acos", math_acos},
@@ -451,6 +460,8 @@ static const luaL_Reg mathlib[] = {
     {"clamp", math_clamp},
     {"sign", math_sign},
     {"round", math_round},
+    {"map", math_map},
+    {"lerp", math_lerp},
     {NULL, NULL},
 };
 
@@ -470,12 +481,6 @@ int luaopen_math(lua_State* L)
     lua_setfield(L, -2, "pi");
     lua_pushnumber(L, HUGE_VAL);
     lua_setfield(L, -2, "huge");
-
-    if (FFlag::LuauMathMap)
-    {
-        lua_pushcfunction(L, math_map, "map");
-        lua_setfield(L, -2, "map");
-    }
 
     return 1;
 }

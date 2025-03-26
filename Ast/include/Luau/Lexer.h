@@ -87,6 +87,12 @@ struct Lexeme
         Reserved_END
     };
 
+    enum struct QuoteStyle
+    {
+        Single,
+        Double,
+    };
+
     Type type;
     Location location;
 
@@ -111,6 +117,8 @@ public:
     Lexeme(const Location& location, Type type, const char* name);
 
     unsigned int getLength() const;
+    unsigned int getBlockDepth() const;
+    QuoteStyle getQuoteStyle() const;
 
     std::string toString() const;
 };
@@ -179,6 +187,11 @@ public:
     static bool fixupQuotedString(std::string& data);
     static void fixupMultilineString(std::string& data);
 
+    unsigned int getOffset() const
+    {
+        return offset;
+    }
+
 private:
     char peekch() const;
     char peekch(unsigned int lookahead) const;
@@ -229,17 +242,6 @@ private:
 
     bool skipComments;
     bool readNames;
-
-    // This offset represents a column offset to be applied to any positions created by the lexer until the next new line.
-    // For example:
-    //     local x = 4
-    //     local y = 5
-    // If we start lexing from the position of `l` in `local x = 4`, the line number will be 1, and the column will be 4
-    // However, because the lexer calculates line offsets by 'index in source buffer where there is a newline', the column
-    // count will start at 0. For this reason, for just the first line, we'll need to store the offset.
-    unsigned int lexResumeOffset;
-
-
 
     enum class BraceType
     {

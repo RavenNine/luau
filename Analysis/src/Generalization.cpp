@@ -2,6 +2,8 @@
 
 #include "Luau/Generalization.h"
 
+#include "Luau/Common.h"
+#include "Luau/DenseHash.h"
 #include "Luau/Scope.h"
 #include "Luau/Type.h"
 #include "Luau/ToString.h"
@@ -10,12 +12,14 @@
 #include "Luau/VisitType.h"
 
 LUAU_FASTFLAG(LuauAutocompleteRefactorsForIncrementalAutocomplete)
+LUAU_FASTFLAGVARIABLE(LuauGeneralizationRemoveRecursiveUpperBound2)
 
 namespace Luau
 {
 
 struct MutatingGeneralizer : TypeOnceVisitor
 {
+    NotNull<TypeArena> arena;
     NotNull<BuiltinTypes> builtinTypes;
 
     NotNull<Scope> scope;
@@ -29,6 +33,7 @@ struct MutatingGeneralizer : TypeOnceVisitor
     bool avoidSealingTables = false;
 
     MutatingGeneralizer(
+        NotNull<TypeArena> arena,
         NotNull<BuiltinTypes> builtinTypes,
         NotNull<Scope> scope,
         NotNull<DenseHashSet<TypeId>> cachedTypes,
@@ -37,6 +42,7 @@ struct MutatingGeneralizer : TypeOnceVisitor
         bool avoidSealingTables
     )
         : TypeOnceVisitor(/* skipBoundTypes */ true)
+        , arena(arena)
         , builtinTypes(builtinTypes)
         , scope(scope)
         , cachedTypes(cachedTypes)
@@ -46,7 +52,7 @@ struct MutatingGeneralizer : TypeOnceVisitor
     {
     }
 
-    static void replace(DenseHashSet<TypeId>& seen, TypeId haystack, TypeId needle, TypeId replacement)
+    void replace(DenseHashSet<TypeId>& seen, TypeId haystack, TypeId needle, TypeId replacement)
     {
         haystack = follow(haystack);
 
@@ -93,6 +99,10 @@ struct MutatingGeneralizer : TypeOnceVisitor
                 LUAU_ASSERT(onlyType != haystack);
                 emplaceType<BoundType>(asMutable(haystack), onlyType);
             }
+            else if (FFlag::LuauGeneralizationRemoveRecursiveUpperBound2 && ut->options.empty())
+            {
+                emplaceType<BoundType>(asMutable(haystack), builtinTypes->neverType);
+            }
 
             return;
         }
@@ -135,6 +145,10 @@ struct MutatingGeneralizer : TypeOnceVisitor
                 TypeId onlyType = it->parts[0];
                 LUAU_ASSERT(onlyType != needle);
                 emplaceType<BoundType>(asMutable(needle), onlyType);
+            } 
+            else if (FFlag::LuauGeneralizationRemoveRecursiveUpperBound2 && it->parts.empty())
+            {
+                emplaceType<BoundType>(asMutable(needle), builtinTypes->unknownType);
             }
 
             return;
@@ -345,7 +359,7 @@ struct FreeTypeSearcher : TypeVisitor
     DenseHashSet<const void*> seenPositive{nullptr};
     DenseHashSet<const void*> seenNegative{nullptr};
 
-    bool seenWithPolarity(const void* ty)
+    bool seenWithCurrentPolarity(const void* ty)
     {
         switch (polarity)
         {
@@ -387,7 +401,7 @@ struct FreeTypeSearcher : TypeVisitor
 
     bool visit(TypeId ty) override
     {
-        if (cachedTypes->contains(ty) || seenWithPolarity(ty))
+        if (cachedTypes->contains(ty) || seenWithCurrentPolarity(ty))
             return false;
 
         LUAU_ASSERT(ty);
@@ -396,7 +410,7 @@ struct FreeTypeSearcher : TypeVisitor
 
     bool visit(TypeId ty, const FreeType& ft) override
     {
-        if (cachedTypes->contains(ty) || seenWithPolarity(ty))
+        if (cachedTypes->contains(ty) || seenWithCurrentPolarity(ty))
             return false;
 
         if (!subsumes(scope, ft.scope))
@@ -421,7 +435,7 @@ struct FreeTypeSearcher : TypeVisitor
 
     bool visit(TypeId ty, const TableType& tt) override
     {
-        if (cachedTypes->contains(ty) || seenWithPolarity(ty))
+        if (cachedTypes->contains(ty) || seenWithCurrentPolarity(ty))
             return false;
 
         if ((tt.state == TableState::Free || tt.state == TableState::Unsealed) && subsumes(scope, tt.scope))
@@ -467,7 +481,7 @@ struct FreeTypeSearcher : TypeVisitor
 
     bool visit(TypeId ty, const FunctionType& ft) override
     {
-        if (cachedTypes->contains(ty) || seenWithPolarity(ty))
+        if (cachedTypes->contains(ty) || seenWithCurrentPolarity(ty))
             return false;
 
         flip();
@@ -486,7 +500,7 @@ struct FreeTypeSearcher : TypeVisitor
 
     bool visit(TypePackId tp, const FreeTypePack& ftp) override
     {
-        if (seenWithPolarity(tp))
+        if (seenWithCurrentPolarity(tp))
             return false;
 
         if (!subsumes(scope, ftp.scope))
@@ -533,7 +547,7 @@ struct TypeCacher : TypeOnceVisitor
     {
     }
 
-    void cache(TypeId ty)
+    void cache(TypeId ty) const
     {
         cachedTypes->insert(ty);
     }
@@ -926,7 +940,8 @@ struct TypeCacher : TypeOnceVisitor
         return false;
     }
 
-    bool visit(TypePackId tp, const BoundTypePack& btp) override {
+    bool visit(TypePackId tp, const BoundTypePack& btp) override
+    {
         traverse(btp.boundTo);
         if (isUncacheable(btp.boundTo))
             markUncacheable(tp);
@@ -969,7 +984,7 @@ std::optional<TypeId> generalize(
     FreeTypeSearcher fts{scope, cachedTypes};
     fts.traverse(ty);
 
-    MutatingGeneralizer gen{builtinTypes, scope, cachedTypes, std::move(fts.positiveTypes), std::move(fts.negativeTypes), avoidSealingTables};
+    MutatingGeneralizer gen{arena, builtinTypes, scope, cachedTypes, std::move(fts.positiveTypes), std::move(fts.negativeTypes), avoidSealingTables};
 
     gen.traverse(ty);
 

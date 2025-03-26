@@ -26,7 +26,7 @@ LUAU_FASTINTVARIABLE(LuauCompileInlineThreshold, 25)
 LUAU_FASTINTVARIABLE(LuauCompileInlineThresholdMaxBoost, 300)
 LUAU_FASTINTVARIABLE(LuauCompileInlineDepth, 5)
 
-LUAU_FASTFLAGVARIABLE(LuauCompileOptimizeRevArith)
+LUAU_FASTFLAGVARIABLE(LuauSeparateCompilerTypeInfo)
 
 namespace Luau
 {
@@ -725,7 +725,7 @@ struct Compiler
         inlineFrames.push_back({func, oldLocals, target, targetCount});
 
         // fold constant values updated above into expressions in the function body
-        foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldMathK, func->body);
+        foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldLibraryK, options.libraryMemberConstantCb, func->body);
 
         bool usedFallthrough = false;
 
@@ -770,7 +770,7 @@ struct Compiler
                 var->type = Constant::Type_Unknown;
         }
 
-        foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldMathK, func->body);
+        foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldLibraryK, options.libraryMemberConstantCb, func->body);
     }
 
     void compileExprCall(AstExprCall* expr, uint8_t target, uint8_t targetCount, bool targetTop = false, bool multRet = false)
@@ -1623,7 +1623,7 @@ struct Compiler
                         return;
                     }
                 }
-                else if (FFlag::LuauCompileOptimizeRevArith && options.optimizationLevel >= 2 && (expr->op == AstExprBinary::Add || expr->op == AstExprBinary::Mul))
+                else if (options.optimizationLevel >= 2 && (expr->op == AstExprBinary::Add || expr->op == AstExprBinary::Mul))
                 {
                     // Optimization: replace k*r with r*k when r is known to be a number (otherwise metamethods may be called)
                     if (LuauBytecodeType* ty = exprTypes.find(expr); ty && *ty == LBC_TYPE_NUMBER)
@@ -3052,7 +3052,7 @@ struct Compiler
             locstants[var].type = Constant::Type_Number;
             locstants[var].valueNumber = from + iv * step;
 
-            foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldMathK, stat);
+            foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldLibraryK, options.libraryMemberConstantCb, stat);
 
             size_t iterJumps = loopJumps.size();
 
@@ -3080,7 +3080,7 @@ struct Compiler
         // clean up fold state in case we need to recompile - normally we compile the loop body once, but due to inlining we may need to do it again
         locstants[var].type = Constant::Type_Unknown;
 
-        foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldMathK, stat);
+        foldConstants(constants, variables, locstants, builtinsFold, builtinsFoldLibraryK, options.libraryMemberConstantCb, stat);
     }
 
     void compileStatFor(AstStatFor* stat)
@@ -4141,7 +4141,7 @@ struct Compiler
     BuiltinAstTypes builtinTypes;
 
     const DenseHashMap<AstExprCall*, int>* builtinsFold = nullptr;
-    bool builtinsFoldMathK = false;
+    bool builtinsFoldLibraryK = false;
 
     // compileFunction state, gets reset for every function
     unsigned int regTop = 0;
@@ -4221,16 +4221,37 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, c
         compiler.builtinsFold = &compiler.builtins;
 
         if (AstName math = names.get("math"); math.value && getGlobalState(compiler.globals, math) == Global::Default)
-            compiler.builtinsFoldMathK = true;
+        {
+            compiler.builtinsFoldLibraryK = true;
+        }
+        else if (const char* const* ptr = options.librariesWithKnownMembers)
+        {
+            for (; *ptr; ++ptr)
+            {
+                if (AstName name = names.get(*ptr); name.value && getGlobalState(compiler.globals, name) == Global::Default)
+                {
+                    compiler.builtinsFoldLibraryK = true;
+                    break;
+                }
+            }
+        }
     }
 
     if (options.optimizationLevel >= 1)
     {
         // this pass tracks which calls are builtins and can be compiled more efficiently
-        analyzeBuiltins(compiler.builtins, compiler.globals, compiler.variables, options, root);
+        analyzeBuiltins(compiler.builtins, compiler.globals, compiler.variables, options, root, names);
 
         // this pass analyzes constantness of expressions
-        foldConstants(compiler.constants, compiler.variables, compiler.locstants, compiler.builtinsFold, compiler.builtinsFoldMathK, root);
+        foldConstants(
+            compiler.constants,
+            compiler.variables,
+            compiler.locstants,
+            compiler.builtinsFold,
+            compiler.builtinsFoldLibraryK,
+            options.libraryMemberConstantCb,
+            root
+        );
 
         // this pass analyzes table assignments to estimate table shapes for initially empty tables
         predictTableShapes(compiler.tableShapes, root);
@@ -4250,19 +4271,40 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, c
     }
 
     // computes type information for all functions based on type annotations
-    if (options.typeInfoLevel >= 1)
-        buildTypeMap(
-            compiler.functionTypes,
-            compiler.localTypes,
-            compiler.exprTypes,
-            root,
-            options.vectorType,
-            compiler.userdataTypes,
-            compiler.builtinTypes,
-            compiler.builtins,
-            compiler.globals,
-            bytecode
-        );
+    if (FFlag::LuauSeparateCompilerTypeInfo)
+    {
+        if (options.typeInfoLevel >= 1 || options.optimizationLevel >= 2)
+            buildTypeMap(
+                compiler.functionTypes,
+                compiler.localTypes,
+                compiler.exprTypes,
+                root,
+                options.vectorType,
+                compiler.userdataTypes,
+                compiler.builtinTypes,
+                compiler.builtins,
+                compiler.globals,
+                options.libraryMemberTypeCb,
+                bytecode
+            );
+    }
+    else
+    {
+        if (options.typeInfoLevel >= 1)
+            buildTypeMap(
+                compiler.functionTypes,
+                compiler.localTypes,
+                compiler.exprTypes,
+                root,
+                options.vectorType,
+                compiler.userdataTypes,
+                compiler.builtinTypes,
+                compiler.builtins,
+                compiler.globals,
+                options.libraryMemberTypeCb,
+                bytecode
+            );
+    }
 
     for (AstExprFunction* expr : functions)
     {
@@ -4277,9 +4319,9 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, c
 
     AstExprFunction main(
         root->location,
-        /*attributes=*/AstArray<AstAttr*>({nullptr, 0}),
-        /*generics= */ AstArray<AstGenericType>(),
-        /*genericPacks= */ AstArray<AstGenericTypePack>(),
+        /* attributes= */ AstArray<AstAttr*>({nullptr, 0}),
+        /* generics= */ AstArray<AstGenericType*>(),
+        /* genericPacks= */ AstArray<AstGenericTypePack*>(),
         /* self= */ nullptr,
         AstArray<AstLocal*>(),
         /* vararg= */ true,
@@ -4338,6 +4380,52 @@ std::string compile(const std::string& source, const CompileOptions& options, co
         std::string error = format(":%d: %s", e.getLocation().begin.line + 1, e.what());
         return BytecodeBuilder::getError(error);
     }
+}
+
+void setCompileConstantNil(CompileConstant* constant)
+{
+    Compile::Constant* target = reinterpret_cast<Compile::Constant*>(constant);
+
+    target->type = Compile::Constant::Type_Nil;
+}
+
+void setCompileConstantBoolean(CompileConstant* constant, bool b)
+{
+    Compile::Constant* target = reinterpret_cast<Compile::Constant*>(constant);
+
+    target->type = Compile::Constant::Type_Boolean;
+    target->valueBoolean = b;
+}
+
+void setCompileConstantNumber(CompileConstant* constant, double n)
+{
+    Compile::Constant* target = reinterpret_cast<Compile::Constant*>(constant);
+
+    target->type = Compile::Constant::Type_Number;
+    target->valueNumber = n;
+}
+
+void setCompileConstantVector(CompileConstant* constant, float x, float y, float z, float w)
+{
+    Compile::Constant* target = reinterpret_cast<Compile::Constant*>(constant);
+
+    target->type = Compile::Constant::Type_Vector;
+    target->valueVector[0] = x;
+    target->valueVector[1] = y;
+    target->valueVector[2] = z;
+    target->valueVector[3] = w;
+}
+
+void setCompileConstantString(CompileConstant* constant, const char* s, size_t l)
+{
+    Compile::Constant* target = reinterpret_cast<Compile::Constant*>(constant);
+
+    if (l > std::numeric_limits<unsigned int>::max())
+        CompileError::raise({}, "Exceeded custom string constant length limit");
+
+    target->type = Compile::Constant::Type_String;
+    target->stringLength = unsigned(l);
+    target->valueString = s;
 }
 
 } // namespace Luau

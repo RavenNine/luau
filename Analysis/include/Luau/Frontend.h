@@ -7,6 +7,7 @@
 #include "Luau/ModuleResolver.h"
 #include "Luau/RequireTracer.h"
 #include "Luau/Scope.h"
+#include "Luau/Set.h"
 #include "Luau/TypeCheckLimits.h"
 #include "Luau/Variant.h"
 #include "Luau/AnyTypeSummary.h"
@@ -31,6 +32,7 @@ struct ModuleResolver;
 struct ParseResult;
 struct HotComment;
 struct BuildQueueItem;
+struct BuildQueueWorkState;
 struct FrontendCancellationToken;
 struct AnyTypeSummary;
 
@@ -56,13 +58,32 @@ struct SourceNode
         return forAutocomplete ? dirtyModuleForAutocomplete : dirtyModule;
     }
 
+    bool hasInvalidModuleDependency(bool forAutocomplete) const
+    {
+        return forAutocomplete ? invalidModuleDependencyForAutocomplete : invalidModuleDependency;
+    }
+
+    void setInvalidModuleDependency(bool value, bool forAutocomplete)
+    {
+        if (forAutocomplete)
+            invalidModuleDependencyForAutocomplete = value;
+        else
+            invalidModuleDependency = value;
+    }
+
     ModuleName name;
     std::string humanReadableName;
     DenseHashSet<ModuleName> requireSet{{}};
     std::vector<std::pair<ModuleName, Location>> requireLocations;
+    Set<ModuleName> dependents{{}};
+
     bool dirtySourceModule = true;
     bool dirtyModule = true;
     bool dirtyModuleForAutocomplete = true;
+
+    bool invalidModuleDependency = true;
+    bool invalidModuleDependencyForAutocomplete = true;
+
     double autocompleteLimitsMult = 1.0;
 };
 
@@ -117,7 +138,7 @@ struct FrontendModuleResolver : ModuleResolver
     std::optional<ModuleInfo> resolveModuleInfo(const ModuleName& currentModuleName, const AstExpr& pathExpr) override;
     std::string getHumanReadableModuleName(const ModuleName& moduleName) const override;
 
-    void setModule(const ModuleName& moduleName, ModulePtr module);
+    bool setModule(const ModuleName& moduleName, ModulePtr module);
     void clearModules();
 
 private:
@@ -151,8 +172,12 @@ struct Frontend
     // Parse and typecheck module graph
     CheckResult check(const ModuleName& name, std::optional<FrontendOptions> optionOverride = {}); // new shininess
 
+    bool allModuleDependenciesValid(const ModuleName& name, bool forAutocomplete = false) const;
+
     bool isDirty(const ModuleName& name, bool forAutocomplete = false) const;
     void markDirty(const ModuleName& name, std::vector<ModuleName>* markedDirty = nullptr);
+
+    void traverseDependents(const ModuleName& name, std::function<bool(SourceNode&)> processSubtree);
 
     /** Borrow a pointer into the SourceModule cache.
      *
@@ -192,6 +217,11 @@ struct Frontend
         std::function<void(std::function<void()> task)> executeTask = {},
         std::function<bool(size_t done, size_t total)> progress = {}
     );
+    std::vector<ModuleName> checkQueuedModules_DEPRECATED(
+        std::optional<FrontendOptions> optionOverride = {},
+        std::function<void(std::function<void()> task)> executeTask = {},
+        std::function<bool(size_t done, size_t total)> progress = {}
+    );
 
     std::optional<CheckResult> getCheckResult(const ModuleName& name, bool accumulateNested, bool forAutocomplete = false);
     std::vector<ModuleName> getRequiredScripts(const ModuleName& name);
@@ -227,6 +257,9 @@ private:
     void checkBuildQueueItem(BuildQueueItem& item);
     void checkBuildQueueItems(std::vector<BuildQueueItem>& items);
     void recordItemResult(const BuildQueueItem& item);
+    void performQueueItemTask(std::shared_ptr<BuildQueueWorkState> state, size_t itemPos);
+    void sendQueueItemTask(std::shared_ptr<BuildQueueWorkState> state, size_t itemPos);
+    void sendQueueCycleItemTask(std::shared_ptr<BuildQueueWorkState> state);
 
     static LintResult classifyLints(const std::vector<LintWarning>& warnings, const Config& config);
 
@@ -272,6 +305,7 @@ ModulePtr check(
     NotNull<ModuleResolver> moduleResolver,
     NotNull<FileResolver> fileResolver,
     const ScopePtr& globalScope,
+    const ScopePtr& typeFunctionScope,
     std::function<void(const ModuleName&, const ScopePtr&)> prepareModuleScope,
     FrontendOptions options,
     TypeCheckLimits limits
@@ -286,6 +320,7 @@ ModulePtr check(
     NotNull<ModuleResolver> moduleResolver,
     NotNull<FileResolver> fileResolver,
     const ScopePtr& globalScope,
+    const ScopePtr& typeFunctionScope,
     std::function<void(const ModuleName&, const ScopePtr&)> prepareModuleScope,
     FrontendOptions options,
     TypeCheckLimits limits,

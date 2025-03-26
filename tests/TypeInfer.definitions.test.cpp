@@ -9,7 +9,8 @@
 
 using namespace Luau;
 
-LUAU_FASTFLAG(LuauNewSolverPrePopulateClasses)
+LUAU_FASTINT(LuauTypeInferRecursionLimit)
+LUAU_FASTFLAG(LuauDontForgetToReduceUnionFunc)
 
 TEST_SUITE_BEGIN("DefinitionTests");
 
@@ -494,7 +495,6 @@ TEST_CASE_FIXTURE(Fixture, "class_definition_indexer")
 
 TEST_CASE_FIXTURE(Fixture, "class_definitions_reference_other_classes")
 {
-    ScopedFastFlag _{FFlag::LuauNewSolverPrePopulateClasses, true};
     loadDefinition(R"(
         declare class Channel
             Messages: { Message }
@@ -539,6 +539,78 @@ TEST_CASE_FIXTURE(Fixture, "definition_file_has_source_module_name_set")
 
     REQUIRE(ctv);
     CHECK_EQ(ctv->definitionModuleName, "@test");
+}
+
+TEST_CASE_FIXTURE(Fixture, "recursive_redefinition_reduces_rightfully")
+{
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local t: {[string]: string} = {}
+
+        local function f()
+            t = t
+        end
+
+        t = t
+    )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "cli_142285_reduce_minted_union_func")
+{
+    ScopedFastFlag sffs[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauDontForgetToReduceUnionFunc, true}
+    };
+
+    CheckResult result = check(R"(
+        local function middle(a: number, b: number): number
+            return math.ceil((a + b) / 2 - 0.5)
+        end
+
+        local function find<T>(array: {T}, item: T): number?
+            local l, m, r = 1, middle(1, #array), #array
+            while l <= r do
+                if item <= array[m] then
+                    if item == array[m] then return m end
+                    m, r = middle(l, m-1), m-1
+                else
+                    l, m = middle(m+1, r), m+1
+                end
+            end
+        return nil
+        end
+    )");
+    LUAU_REQUIRE_ERROR_COUNT(3, result);
+    // There are three errors in the above snippet, but they should all be where
+    // clause needed errors.
+    for (const auto& e: result.errors)
+        CHECK(get<WhereClauseNeeded>(e));
+}
+
+TEST_CASE_FIXTURE(Fixture, "vector3_overflow")
+{
+    // We set this to zero to ensure that we either run to completion or stack overflow here.
+    ScopedFastInt sfi{FInt::LuauTypeInferRecursionLimit, 0};
+
+    loadDefinition(R"(
+        declare class Vector3
+            function __add(self, other: Vector3): Vector3
+        end
+    )");
+
+    CheckResult result = check(R"(
+--!strict
+local function graphPoint(t : number, points : { Vector3 }) : Vector3
+    local n : number = #points - 1
+    local p : Vector3 = (nil :: any)
+    for i = 0, n do
+        local x = points[i + 1]
+        p = p and p + x or x
+    end
+    return p
+end
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
 }
 
 TEST_SUITE_END();

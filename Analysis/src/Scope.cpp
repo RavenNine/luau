@@ -84,6 +84,17 @@ std::optional<TypeId> Scope::lookupUnrefinedType(DefId def) const
     return std::nullopt;
 }
 
+std::optional<TypeId> Scope::lookupRValueRefinementType(DefId def) const
+{
+    for (const Scope* current = this; current; current = current->parent.get())
+    {
+        if (auto ty = current->rvalueRefinements.find(def))
+            return *ty;
+    }
+
+    return std::nullopt;
+}
+
 std::optional<TypeId> Scope::lookup(DefId def) const
 {
     for (const Scope* current = this; current; current = current->parent.get())
@@ -181,6 +192,29 @@ std::optional<Binding> Scope::linearSearchForBinding(const std::string& name, bo
     return std::nullopt;
 }
 
+std::optional<std::pair<Symbol, Binding>> Scope::linearSearchForBindingPair(const std::string& name, bool traverseScopeChain) const
+{
+    const Scope* scope = this;
+
+    while (scope)
+    {
+        for (auto& [n, binding] : scope->bindings)
+        {
+            if (n.local && n.local->name == name.c_str())
+                return {{n, binding}};
+            else if (n.global.value && n.global == name.c_str())
+                return {{n, binding}};
+        }
+
+        scope = scope->parent.get();
+
+        if (!traverseScopeChain)
+            break;
+    }
+
+    return std::nullopt;
+}
+
 // Updates the `this` scope with the assignments from the `childScope` including ones that doesn't exist in `this`.
 void Scope::inheritAssignments(const ScopePtr& childScope)
 {
@@ -209,6 +243,16 @@ void Scope::inheritRefinements(const ScopePtr& childScope)
         if (lookup(symbol))
             refinements[k] = a;
     }
+}
+
+bool Scope::shouldWarnGlobal(std::string name) const
+{
+    for (const Scope* current = this; current; current = current->parent.get())
+    {
+        if (current->globalsToWarn.contains(name))
+            return true;
+    }
+    return false;
 }
 
 bool subsumesStrict(Scope* left, Scope* right)

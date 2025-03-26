@@ -96,6 +96,9 @@ struct ConstraintGenerator
     // will enqueue them during solving.
     std::vector<ConstraintPtr> unqueuedConstraints;
 
+    // Map a function's signature scope back to its signature type.
+    DenseHashMap<Scope*, TypeId> scopeToFunction{nullptr};
+
     // The private scope of type aliases for which the type parameters belong to.
     DenseHashMap<const AstStatTypeAlias*, ScopePtr> astTypeAliasDefiningScopes{nullptr};
 
@@ -114,12 +117,15 @@ struct ConstraintGenerator
 
     // Needed to register all available type functions for execution at later stages.
     NotNull<TypeFunctionRuntime> typeFunctionRuntime;
+    DenseHashMap<const AstStatTypeFunction*, ScopePtr> astTypeFunctionEnvironmentScopes{nullptr};
+
     // Needed to resolve modules to make 'require' import types properly.
     NotNull<ModuleResolver> moduleResolver;
     // Occasionally constraint generation needs to produce an ICE.
     const NotNull<InternalErrorReporter> ice;
 
     ScopePtr globalScope;
+    ScopePtr typeFunctionScope;
 
     std::function<void(const ModuleName&, const ScopePtr&)> prepareModuleScope;
     std::vector<RequireCycle> requireCycles;
@@ -137,6 +143,7 @@ struct ConstraintGenerator
         NotNull<BuiltinTypes> builtinTypes,
         NotNull<InternalErrorReporter> ice,
         const ScopePtr& globalScope,
+        const ScopePtr& typeFunctionScope,
         std::function<void(const ModuleName&, const ScopePtr&)> prepareModuleScope,
         DcrLogger* logger,
         NotNull<DataFlowGraph> dfg,
@@ -392,7 +399,7 @@ private:
      **/
     std::vector<std::pair<Name, GenericTypeDefinition>> createGenerics(
         const ScopePtr& scope,
-        AstArray<AstGenericType> generics,
+        AstArray<AstGenericType*> generics,
         bool useCache = false,
         bool addTypes = true
     );
@@ -409,7 +416,7 @@ private:
      **/
     std::vector<std::pair<Name, GenericTypePackDefinition>> createGenericPacks(
         const ScopePtr& scope,
-        AstArray<AstGenericTypePack> packs,
+        AstArray<AstGenericTypePack*> packs,
         bool useCache = false,
         bool addTypes = true
     );

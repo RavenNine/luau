@@ -13,7 +13,6 @@
 static const int kMinMaxUnrolledParams = 5;
 static const int kBit32BinaryOpUnrolledParams = 5;
 
-LUAU_FASTFLAGVARIABLE(LuauVectorLibNativeCodegen);
 LUAU_FASTFLAGVARIABLE(LuauVectorLibNativeDot);
 
 namespace Luau
@@ -282,6 +281,40 @@ static BuiltinImplResult translateBuiltinMathClamp(
         build.inst(IrCmd::STORE_TAG, build.vmReg(ra), build.constTag(LUA_TNUMBER));
 
     return {BuiltinImplType::UsesFallback, 1};
+}
+
+static BuiltinImplResult translateBuiltinMathLerp(
+    IrBuilder& build,
+    int nparams,
+    int ra,
+    int arg,
+    IrOp args,
+    IrOp arg3,
+    int nresults,
+    IrOp fallback,
+    int pcpos
+)
+{
+    if (nparams < 3 || nresults > 1)
+        return {BuiltinImplType::None, -1};
+
+    builtinCheckDouble(build, build.vmReg(arg), pcpos);
+    builtinCheckDouble(build, args, pcpos);
+    builtinCheckDouble(build, arg3, pcpos);
+
+    IrOp a = builtinLoadDouble(build, build.vmReg(arg));
+    IrOp b = builtinLoadDouble(build, args);
+    IrOp t = builtinLoadDouble(build, arg3);
+
+    IrOp l = build.inst(IrCmd::ADD_NUM, a, build.inst(IrCmd::MUL_NUM, build.inst(IrCmd::SUB_NUM, b, a), t));
+    IrOp r = build.inst(IrCmd::SELECT_NUM, l, b, t, build.constDouble(1.0)); // select on t==1.0
+
+    build.inst(IrCmd::STORE_DOUBLE, build.vmReg(ra), r);
+
+    if (ra != arg)
+        build.inst(IrCmd::STORE_TAG, build.vmReg(ra), build.constTag(LUA_TNUMBER));
+
+    return {BuiltinImplType::Full, 1};
 }
 
 static BuiltinImplResult translateBuiltinMathUnary(IrBuilder& build, IrCmd cmd, int nparams, int ra, int arg, int nresults, int pcpos)
@@ -899,8 +932,6 @@ static BuiltinImplResult translateBuiltinVectorMagnitude(
     int pcpos
 )
 {
-    LUAU_ASSERT(FFlag::LuauVectorLibNativeCodegen);
-
     IrOp arg1 = build.vmReg(arg);
 
     if (nparams != 1 || nresults > 1 || arg1.kind == IrOpKind::Constant)
@@ -948,8 +979,6 @@ static BuiltinImplResult translateBuiltinVectorNormalize(
     int pcpos
 )
 {
-    LUAU_ASSERT(FFlag::LuauVectorLibNativeCodegen);
-
     IrOp arg1 = build.vmReg(arg);
 
     if (nparams != 1 || nresults > 1 || arg1.kind == IrOpKind::Constant)
@@ -1000,8 +1029,6 @@ static BuiltinImplResult translateBuiltinVectorNormalize(
 
 static BuiltinImplResult translateBuiltinVectorCross(IrBuilder& build, int nparams, int ra, int arg, IrOp args, IrOp arg3, int nresults, int pcpos)
 {
-    LUAU_ASSERT(FFlag::LuauVectorLibNativeCodegen);
-
     IrOp arg1 = build.vmReg(arg);
 
     if (nparams != 2 || nresults > 1 || arg1.kind == IrOpKind::Constant || args.kind == IrOpKind::Constant)
@@ -1039,8 +1066,6 @@ static BuiltinImplResult translateBuiltinVectorCross(IrBuilder& build, int npara
 
 static BuiltinImplResult translateBuiltinVectorDot(IrBuilder& build, int nparams, int ra, int arg, IrOp args, IrOp arg3, int nresults, int pcpos)
 {
-    LUAU_ASSERT(FFlag::LuauVectorLibNativeCodegen);
-
     IrOp arg1 = build.vmReg(arg);
 
     if (nparams != 2 || nresults > 1 || arg1.kind == IrOpKind::Constant || args.kind == IrOpKind::Constant)
@@ -1093,8 +1118,6 @@ static BuiltinImplResult translateBuiltinVectorMap1(
     int pcpos
 )
 {
-    LUAU_ASSERT(FFlag::LuauVectorLibNativeCodegen);
-
     IrOp arg1 = build.vmReg(arg);
 
     if (nparams != 1 || nresults > 1 || arg1.kind == IrOpKind::Constant)
@@ -1128,8 +1151,6 @@ static BuiltinImplResult translateBuiltinVectorClamp(
     int pcpos
 )
 {
-    LUAU_ASSERT(FFlag::LuauVectorLibNativeCodegen);
-
     IrOp arg1 = build.vmReg(arg);
 
     if (nparams != 3 || nresults > 1 || arg1.kind == IrOpKind::Constant || args.kind == IrOpKind::Constant || arg3.kind == IrOpKind::Constant)
@@ -1194,8 +1215,6 @@ static BuiltinImplResult translateBuiltinVectorMap2(
     int pcpos
 )
 {
-    LUAU_ASSERT(FFlag::LuauVectorLibNativeCodegen);
-
     IrOp arg1 = build.vmReg(arg);
 
     if (nparams != 2 || nresults > 1 || arg1.kind == IrOpKind::Constant || args.kind == IrOpKind::Constant)
@@ -1236,8 +1255,6 @@ BuiltinImplResult translateBuiltin(
     int pcpos
 )
 {
-    BuiltinImplResult noneResult = {BuiltinImplType::None, -1};
-
     // Builtins are not allowed to handle variadic arguments
     if (nparams == LUA_MULTRET)
         return {BuiltinImplType::None, -1};
@@ -1359,34 +1376,29 @@ BuiltinImplResult translateBuiltin(
     case LBF_BUFFER_WRITEF64:
         return translateBuiltinBufferWrite(build, nparams, ra, arg, args, arg3, nresults, pcpos, IrCmd::BUFFER_WRITEF64, 8, IrCmd::NOP);
     case LBF_VECTOR_MAGNITUDE:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorMagnitude(build, nparams, ra, arg, args, arg3, nresults, pcpos) : noneResult;
+        return translateBuiltinVectorMagnitude(build, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_NORMALIZE:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorNormalize(build, nparams, ra, arg, args, arg3, nresults, pcpos) : noneResult;
+        return translateBuiltinVectorNormalize(build, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_CROSS:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorCross(build, nparams, ra, arg, args, arg3, nresults, pcpos) : noneResult;
+        return translateBuiltinVectorCross(build, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_DOT:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorDot(build, nparams, ra, arg, args, arg3, nresults, pcpos) : noneResult;
+        return translateBuiltinVectorDot(build, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_FLOOR:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorMap1(build, IrCmd::FLOOR_NUM, nparams, ra, arg, args, arg3, nresults, pcpos)
-                                                 : noneResult;
+        return translateBuiltinVectorMap1(build, IrCmd::FLOOR_NUM, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_CEIL:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorMap1(build, IrCmd::CEIL_NUM, nparams, ra, arg, args, arg3, nresults, pcpos)
-                                                 : noneResult;
+        return translateBuiltinVectorMap1(build, IrCmd::CEIL_NUM, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_ABS:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorMap1(build, IrCmd::ABS_NUM, nparams, ra, arg, args, arg3, nresults, pcpos)
-                                                 : noneResult;
+        return translateBuiltinVectorMap1(build, IrCmd::ABS_NUM, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_SIGN:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorMap1(build, IrCmd::SIGN_NUM, nparams, ra, arg, args, arg3, nresults, pcpos)
-                                                 : noneResult;
+        return translateBuiltinVectorMap1(build, IrCmd::SIGN_NUM, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_CLAMP:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorClamp(build, nparams, ra, arg, args, arg3, nresults, fallback, pcpos)
-                                                 : noneResult;
+        return translateBuiltinVectorClamp(build, nparams, ra, arg, args, arg3, nresults, fallback, pcpos);
     case LBF_VECTOR_MIN:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorMap2(build, IrCmd::MIN_NUM, nparams, ra, arg, args, arg3, nresults, pcpos)
-                                                 : noneResult;
+        return translateBuiltinVectorMap2(build, IrCmd::MIN_NUM, nparams, ra, arg, args, arg3, nresults, pcpos);
     case LBF_VECTOR_MAX:
-        return FFlag::LuauVectorLibNativeCodegen ? translateBuiltinVectorMap2(build, IrCmd::MAX_NUM, nparams, ra, arg, args, arg3, nresults, pcpos)
-                                                 : noneResult;
+        return translateBuiltinVectorMap2(build, IrCmd::MAX_NUM, nparams, ra, arg, args, arg3, nresults, pcpos);
+    case LBF_MATH_LERP:
+        return translateBuiltinMathLerp(build, nparams, ra, arg, args, arg3, nresults, fallback, pcpos);
     default:
         return {BuiltinImplType::None, -1};
     }

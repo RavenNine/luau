@@ -7,6 +7,7 @@
 #include "Luau/IrBuilder.h"
 #include "Luau/IrDump.h"
 #include "Luau/IrUtils.h"
+#include "Luau/LoweringStats.h"
 #include "Luau/OptimizeConstProp.h"
 #include "Luau/OptimizeDeadStore.h"
 #include "Luau/OptimizeFinalX64.h"
@@ -101,7 +102,7 @@ inline bool lowerImpl(
 
     bool outputEnabled = options.includeAssembly || options.includeIr;
 
-    IrToStringContext ctx{build.text, function.blocks, function.constants, function.cfg};
+    IrToStringContext ctx{build.text, function.blocks, function.constants, function.cfg, function.proto};
 
     // We use this to skip outlined fallback blocks from IR/asm text output
     size_t textSize = build.text.length();
@@ -298,6 +299,8 @@ inline bool lowerFunction(
     CodeGenCompilationResult& codeGenCompilationResult
 )
 {
+    ir.function.stats = stats;
+
     killUnusedBlocks(ir.function);
 
     unsigned preOptBlockCount = 0;

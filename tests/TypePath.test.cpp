@@ -17,6 +17,7 @@ using namespace Luau::TypePath;
 
 LUAU_FASTFLAG(LuauSolverV2);
 LUAU_DYNAMIC_FASTINT(LuauTypePathMaximumTraverseSteps);
+LUAU_FASTFLAG(LuauFreeTypesMustHaveBounds);
 
 struct TypePathFixture : Fixture
 {
@@ -277,7 +278,7 @@ TEST_CASE_FIXTURE(TypePathFixture, "bounds")
         TypeArena& arena = frontend.globals.globalTypes;
         unfreeze(arena);
 
-        TypeId ty = arena.freshType(frontend.globals.globalScope.get());
+        TypeId ty = arena.freshType(frontend.builtinTypes, frontend.globals.globalScope.get());
         FreeType* ft = getMutable<FreeType>(ty);
 
         SUBCASE("upper")
@@ -551,6 +552,14 @@ TEST_CASE("index")
 TEST_CASE("chain")
 {
     CHECK(toString(PathBuilder().index(0).mt().build()) == "[0].metatable()");
+}
+
+TEST_CASE("human_property_then_metatable_portion")
+{
+    ScopedFastFlag sff{FFlag::LuauSolverV2, true};
+
+    CHECK(toStringHuman(PathBuilder().readProp("a").mt().build()) == "accessing `a` has the metatable portion as ");
+    CHECK(toStringHuman(PathBuilder().writeProp("a").mt().build()) == "writing to `a` has the metatable portion as ");
 }
 
 TEST_SUITE_END(); // TypePathToString
