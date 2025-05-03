@@ -9,6 +9,8 @@
 
 LUAU_FASTFLAG(LuauSolverV2);
 LUAU_FASTFLAG(LintRedundantNativeAttribute);
+LUAU_FASTFLAG(LuauDeprecatedAttribute);
+LUAU_FASTFLAG(LuauNonReentrantGeneralization2);
 
 using namespace Luau;
 
@@ -1251,15 +1253,19 @@ _ = {
     [2] = 2,
     [1] = 3,
 }
+
+function _foo(): { first: number, second: string, first: boolean }
+end
 )");
 
-    REQUIRE(6 == result.warnings.size());
+    REQUIRE(7 == result.warnings.size());
     CHECK_EQ(result.warnings[0].text, "Table field 'first' is a duplicate; previously defined at line 3");
     CHECK_EQ(result.warnings[1].text, "Table field 'first' is a duplicate; previously defined at line 9");
     CHECK_EQ(result.warnings[2].text, "Table index 1 is a duplicate; previously defined as a list entry");
     CHECK_EQ(result.warnings[3].text, "Table index 3 is a duplicate; previously defined as a list entry");
     CHECK_EQ(result.warnings[4].text, "Table type field 'first' is a duplicate; previously defined at line 24");
     CHECK_EQ(result.warnings[5].text, "Table index 1 is a duplicate; previously defined at line 36");
+    CHECK_EQ(result.warnings[6].text, "Table type field 'first' is a duplicate; previously defined at line 41");
 }
 
 TEST_CASE_FIXTURE(Fixture, "read_write_table_props")
@@ -1296,6 +1302,19 @@ TEST_CASE_FIXTURE(Fixture, "ImportOnlyUsedInTypeAnnotation")
 
     REQUIRE(1 == result.warnings.size());
     CHECK_EQ(result.warnings[0].text, "Variable 'x' is never used; prefix with '_' to silence");
+}
+
+TEST_CASE_FIXTURE(Fixture, "ImportOnlyUsedInReturnType")
+{
+    LintResult result = lint(R"(
+        local Foo = require(script.Parent.Foo)
+
+        function foo(): Foo.Y
+        end
+    )");
+
+    REQUIRE(1 == result.warnings.size());
+    CHECK_EQ(result.warnings[0].text, "Function 'foo' is never used; prefix with '_' to silence");
 }
 
 TEST_CASE_FIXTURE(Fixture, "DisableUnknownGlobalWithTypeChecking")
@@ -1503,11 +1522,11 @@ TEST_CASE_FIXTURE(Fixture, "LintHygieneUAF")
 TEST_CASE_FIXTURE(BuiltinsFixture, "DeprecatedApiTyped")
 {
     unfreeze(frontend.globals.globalTypes);
-    TypeId instanceType = frontend.globals.globalTypes.addType(ClassType{"Instance", {}, std::nullopt, std::nullopt, {}, {}, "Test", {}});
+    TypeId instanceType = frontend.globals.globalTypes.addType(ExternType{"Instance", {}, std::nullopt, std::nullopt, {}, {}, "Test", {}});
     persist(instanceType);
     frontend.globals.globalScope->exportedTypeBindings["Instance"] = TypeFun{{}, instanceType};
 
-    getMutable<ClassType>(instanceType)->props = {
+    getMutable<ExternType>(instanceType)->props = {
         {"Name", {builtinTypes->stringType}},
         {"DataCost", {builtinTypes->numberType, /* deprecated= */ true}},
         {"Wait", {builtinTypes->anyType, /* deprecated= */ true}},
@@ -1600,8 +1619,331 @@ setfenv(h :: any, {})
     CHECK_EQ(result.warnings[3].location.begin.line + 1, 11);
 }
 
+static void checkDeprecatedWarning(const Luau::LintWarning& warning, const Luau::Position& begin, const Luau::Position& end, const char* msg)
+{
+    CHECK_EQ(warning.code, LintWarning::Code_DeprecatedApi);
+    CHECK_EQ(warning.location, Location(begin, end));
+    CHECK_EQ(warning.text, msg);
+}
+
+TEST_CASE_FIXTURE(Fixture, "DeprecatedAttribute")
+{
+    ScopedFastFlag sff[] = {{FFlag::LuauDeprecatedAttribute, true}, {FFlag::LuauSolverV2, true}};
+
+    // @deprecated works on local functions
+    {
+        LintResult result = lint(R"(
+@deprecated
+local function testfun(x)
+    return x + 1
+end
+
+testfun(1)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(6, 0), Position(6, 7), "Function 'testfun' is deprecated");
+    }
+
+    // @deprecated works on globals functions
+    {
+        LintResult result = lint(R"(
+@deprecated
+function testfun(x)
+    return x + 1
+end
+
+testfun(1)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(6, 0), Position(6, 7), "Function 'testfun' is deprecated");
+    }
+
+    // @deprecated works on fully typed functions
+    {
+        LintResult result = lint(R"(
+@deprecated
+local function testfun(x:number):number
+    return x + 1
+end
+
+if math.random(2) == 2 then
+    testfun(1)
+end
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(7, 4), Position(7, 11), "Function 'testfun' is deprecated");
+    }
+
+    // @deprecated works on functions without an explicit return type
+    {
+        LintResult result = lint(R"(
+@deprecated
+local function testfun(x:number)
+    return x + 1
+end
+
+g(testfun)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(6, 2), Position(6, 9), "Function 'testfun' is deprecated");
+    }
+
+    // @deprecated works on functions without an explicit argument type
+    {
+        LintResult result = lint(R"(
+@deprecated
+local function testfun(x):number
+    if x == 1 then
+        return x
+    else
+        return 1 + testfun(x - 1)
+    end
+end
+
+testfun(1)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(10, 0), Position(10, 7), "Function 'testfun' is deprecated");
+    }
+
+    // @deprecated works on inner functions
+    {
+        LintResult result = lint(R"(
+function flipFlop()
+    local state = false
+
+    @deprecated
+    local function invert()
+        state = !state
+        return state
+    end
+
+    return invert
+end
+
+f = flipFlop()
+assert(f() == true)
+)");
+
+        REQUIRE(2 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(10, 11), Position(10, 17), "Function 'invert' is deprecated");
+        checkDeprecatedWarning(result.warnings[1], Position(14, 7), Position(14, 8), "Function 'f' is deprecated");
+    }
+
+    // @deprecated does not automatically apply to inner functions
+    {
+        LintResult result = lint(R"(
+@deprecated
+function flipFlop()
+    local state = false
+
+    local function invert()
+        state = !state
+        return state
+    end
+
+    return invert
+end
+
+f = flipFlop()
+assert(f() == true)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(13, 4), Position(13, 12), "Function 'flipFlop' is deprecated");
+    }
+
+    // @deprecated works correctly if deprecated function is shadowed
+    {
+        LintResult result = lint(R"(
+@deprecated
+local function doTheThing()
+    print("doing")
+end
+
+doTheThing()
+
+local function shadow()
+    local function doTheThing()
+        print("doing!")
+    end
+
+    doTheThing()
+end
+
+shadow()
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(6, 0), Position(6, 10), "Function 'doTheThing' is deprecated");
+    }
+
+    // @deprecated does not issue warnings if a deprecated function uses itself
+    {
+        LintResult result = lint(R"(
+@deprecated
+function fibonacci(n)
+    if n == 0 then
+        return 0
+    elseif n == 1 then
+        return 1
+    else
+        return fibonacci(n - 1) + fibonacci(n - 2)
+    end
+end
+
+fibonacci(5)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(12, 0), Position(12, 9), "Function 'fibonacci' is deprecated");
+    }
+
+    // @deprecated works for mutually recursive functions
+    {
+        LintResult result = lint(R"(
+@deprecated
+function odd(x)
+    if x == 0 then
+        return false
+    else
+        return even(x - 1)
+    end
+end
+
+@deprecated
+function even(x)
+    if x == 0 then
+        return true
+    else
+        return odd(x - 1)
+    end
+end
+
+assert(odd(1) == true)
+assert(even(0) == true)
+)");
+
+        REQUIRE(4 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(6, 15), Position(6, 19), "Function 'even' is deprecated");
+        checkDeprecatedWarning(result.warnings[1], Position(15, 15), Position(15, 18), "Function 'odd' is deprecated");
+        checkDeprecatedWarning(result.warnings[2], Position(19, 7), Position(19, 10), "Function 'odd' is deprecated");
+        checkDeprecatedWarning(result.warnings[3], Position(20, 7), Position(20, 11), "Function 'even' is deprecated");
+    }
+
+    // @deprecated works for methods with a literal class name
+    {
+        LintResult result = lint(R"(
+Account = { balance=0 }
+
+@deprecated
+function Account:deposit(v)
+    self.balance = self.balance + v
+end
+
+Account:deposit(200.00)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(8, 0), Position(8, 15), "Member 'Account.deposit' is deprecated");
+    }
+
+    // @deprecated works for methods with a compound expression class name
+    {
+        LintResult result = lint(R"(
+Account = { balance=0 }
+
+function getAccount()
+    return Account
+end
+
+@deprecated
+function Account:deposit (v)
+    self.balance = self.balance + v
+end
+
+(getAccount()):deposit(200.00)
+)");
+
+        REQUIRE(1 == result.warnings.size());
+        checkDeprecatedWarning(result.warnings[0], Position(12, 0), Position(12, 22), "Member 'deposit' is deprecated");
+    }
+}
+
+TEST_CASE_FIXTURE(Fixture, "DeprecatedAttributeFunctionDeclaration")
+{
+    ScopedFastFlag sff[] = {{FFlag::LuauDeprecatedAttribute, true}, {FFlag::LuauSolverV2, true}};
+
+    // @deprecated works on function type declarations
+
+    loadDefinition(R"(
+@deprecated declare function bar(x: number): string
+)");
+
+    LintResult result = lint(R"(
+bar(2)
+)");
+
+    REQUIRE(1 == result.warnings.size());
+    checkDeprecatedWarning(result.warnings[0], Position(1, 0), Position(1, 3), "Function 'bar' is deprecated");
+}
+
+TEST_CASE_FIXTURE(Fixture, "DeprecatedAttributeTableDeclaration")
+{
+    ScopedFastFlag sff[] = {{FFlag::LuauDeprecatedAttribute, true}, {FFlag::LuauSolverV2, true}};
+
+    // @deprecated works on table type declarations
+
+    loadDefinition(R"(
+declare Hooty : {
+    tooty : @deprecated @checked (number) -> number
+}
+)");
+
+    LintResult result = lint(R"(
+print(Hooty:tooty(2.0))
+)");
+
+    REQUIRE(1 == result.warnings.size());
+    checkDeprecatedWarning(result.warnings[0], Position(1, 6), Position(1, 17), "Member 'Hooty.tooty' is deprecated");
+}
+
+TEST_CASE_FIXTURE(Fixture, "DeprecatedAttributeMethodDeclaration")
+{
+    ScopedFastFlag sff[] = {{FFlag::LuauDeprecatedAttribute, true}, {FFlag::LuauSolverV2, true}};
+
+    // @deprecated works on table type declarations
+
+    loadDefinition(R"(
+declare class Foo
+   @deprecated
+   function bar(self, value: number) : number
+end
+
+declare Foo: {
+   new: () -> Foo
+}
+)");
+
+    LintResult result = lint(R"(
+local foo = Foo.new()
+print(foo:bar(2.0))
+)");
+
+    REQUIRE(1 == result.warnings.size());
+    checkDeprecatedWarning(result.warnings[0], Position(2, 6), Position(2, 13), "Member 'bar' is deprecated");
+}
+
 TEST_CASE_FIXTURE(BuiltinsFixture, "TableOperations")
 {
+    // FIXME: For now this flag causes a stack overflow on Windows.
+    ScopedFastFlag _{FFlag::LuauNonReentrantGeneralization2, false};
+
     LintResult result = lint(R"(
 local t = {}
 local tt = {}

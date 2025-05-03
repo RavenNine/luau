@@ -22,26 +22,25 @@
 #include "Luau/Module.h"
 #include "Luau/Clone.h"
 #include "AutocompleteCore.h"
+#include <optional>
 
 LUAU_FASTINT(LuauTypeInferRecursionLimit);
 LUAU_FASTINT(LuauTypeInferIterationLimit);
 LUAU_FASTINT(LuauTarjanChildLimit)
-LUAU_FASTFLAG(LuauAutocompleteRefactorsForIncrementalAutocomplete)
 
-LUAU_FASTFLAGVARIABLE(LuauIncrementalAutocompleteBugfixes)
-LUAU_FASTFLAGVARIABLE(LuauMixedModeDefFinderTraversesTypeOf)
-LUAU_FASTFLAGVARIABLE(LuauCloneIncrementalModule)
-LUAU_FASTFLAGVARIABLE(LogFragmentsFromAutocomplete)
+LUAU_FASTFLAGVARIABLE(DebugLogFragmentsFromAutocomplete)
 LUAU_FASTFLAGVARIABLE(LuauBetterCursorInCommentDetection)
 LUAU_FASTFLAGVARIABLE(LuauAllFreeTypesHaveScopes)
-LUAU_FASTFLAGVARIABLE(LuauFragmentAcSupportsReporter)
 LUAU_FASTFLAGVARIABLE(LuauPersistConstraintGenerationScopes)
-LUAU_FASTFLAG(LuauModuleHoldsAstRoot)
 LUAU_FASTFLAGVARIABLE(LuauCloneTypeAliasBindings)
-LUAU_FASTFLAGVARIABLE(LuauCloneReturnTypePack)
 LUAU_FASTFLAGVARIABLE(LuauIncrementalAutocompleteDemandBasedCloning)
 LUAU_FASTFLAG(LuauUserTypeFunTypecheck)
 LUAU_FASTFLAGVARIABLE(LuauFragmentNoTypeFunEval)
+LUAU_FASTFLAGVARIABLE(LuauBetterScopeSelection)
+LUAU_FASTFLAGVARIABLE(LuauBlockDiffFragmentSelection)
+LUAU_FASTFLAGVARIABLE(LuauFragmentAcMemoryLeak)
+LUAU_FASTFLAGVARIABLE(LuauGlobalVariableModuleIsolation)
+LUAU_FASTFLAG(LuauStoreReturnTypesAsPackOnAst)
 
 namespace
 {
@@ -87,6 +86,437 @@ void cloneModuleMap(
     }
 }
 
+static std::pair<size_t, size_t> getDocumentOffsets(std::string_view src, const Position& startPos, const Position& endPos);
+
+// when typing a function partially, get the span of the first line
+// e.g. local function fn() : ... - typically we want to provide autocomplete results if you're
+// editing type annotations in this range
+Location getFunctionDeclarationExtents(AstExprFunction* exprFn, AstExpr* exprName = nullptr, AstLocal* localName = nullptr)
+{
+    auto fnBegin = exprFn->location.begin;
+    auto fnEnd = exprFn->location.end;
+    if (auto returnAnnot = exprFn->returnAnnotation; FFlag::LuauStoreReturnTypesAsPackOnAst && returnAnnot)
+    {
+        fnEnd = returnAnnot->location.end;
+    }
+    else if (auto returnAnnot = exprFn->returnAnnotation_DEPRECATED; !FFlag::LuauStoreReturnTypesAsPackOnAst && returnAnnot)
+    {
+        if (returnAnnot->tailType)
+            fnEnd = returnAnnot->tailType->location.end;
+        else if (returnAnnot->types.size != 0)
+            fnEnd = returnAnnot->types.data[returnAnnot->types.size - 1]->location.end;
+    }
+    else if (exprFn->args.size != 0)
+    {
+        auto last = exprFn->args.data[exprFn->args.size - 1];
+        if (last->annotation)
+            fnEnd = last->annotation->location.end;
+        else
+            fnEnd = last->location.end;
+    }
+    else if (exprFn->genericPacks.size != 0)
+        fnEnd = exprFn->genericPacks.data[exprFn->genericPacks.size - 1]->location.end;
+    else if (exprFn->generics.size != 0)
+        fnEnd = exprFn->generics.data[exprFn->generics.size - 1]->location.end;
+    else if (exprName)
+        fnEnd = exprName->location.end;
+    else if (localName)
+        fnEnd = localName->location.end;
+    return Location{fnBegin, fnEnd};
+};
+
+Location getAstStatForExtents(AstStatFor* forStat)
+{
+    auto begin = forStat->location.begin;
+    auto end = forStat->location.end;
+    if (forStat->step)
+        end = forStat->step->location.end;
+    else if (forStat->to)
+        end = forStat->to->location.end;
+    else if (forStat->from)
+        end = forStat->from->location.end;
+    else if (forStat->var)
+        end = forStat->var->location.end;
+
+    return Location{begin, end};
+}
+
+Location getFragmentLocation(AstStat* nearestStatement, const Position& cursorPosition)
+{
+    Location empty{cursorPosition, cursorPosition};
+    if (nearestStatement)
+    {
+        Location nonEmpty{nearestStatement->location.begin, cursorPosition};
+        // If your sibling is a do block, do nothing
+        if (auto doEnd = nearestStatement->as<AstStatBlock>())
+            return empty;
+
+        // If you're inside the body of the function and this is your sibling, empty fragment
+        // If you're outside the body (e.g. you're typing stuff out, non-empty)
+        if (auto fn = nearestStatement->as<AstStatFunction>())
+        {
+            auto loc = getFunctionDeclarationExtents(fn->func, fn->name, /* local */ nullptr);
+            if (loc.containsClosed(cursorPosition))
+                return nonEmpty;
+            else if (fn->func->body->location.containsClosed(cursorPosition) || fn->location.end <= cursorPosition)
+                return empty;
+            else if (fn->func->location.contains(cursorPosition))
+                return nonEmpty;
+        }
+
+        if (auto fn = nearestStatement->as<AstStatLocalFunction>())
+        {
+            auto loc = getFunctionDeclarationExtents(fn->func, /* global func */ nullptr, fn->name);
+            if (loc.containsClosed(cursorPosition))
+                return nonEmpty;
+            else if (fn->func->body->location.containsClosed(cursorPosition) || fn->location.end <= cursorPosition)
+                return empty;
+            else if (fn->func->location.contains(cursorPosition))
+                return nonEmpty;
+        }
+
+        if (auto wh = nearestStatement->as<AstStatWhile>())
+        {
+            if (!wh->hasDo)
+                return nonEmpty;
+            else
+                return empty;
+        }
+
+        if (auto forStat = nearestStatement->as<AstStatFor>())
+        {
+            if (!forStat->hasDo)
+                return nonEmpty;
+            else
+                return empty;
+        }
+
+        if (auto forIn = nearestStatement->as<AstStatForIn>())
+        {
+            // If we don't have a do statement
+            if (!forIn->hasDo)
+                return nonEmpty;
+            else
+                return empty;
+        }
+
+        if (auto ifS = nearestStatement->as<AstStatIf>())
+        {
+            auto conditionExtents = Location{ifS->location.begin, ifS->condition->location.end};
+            if (conditionExtents.containsClosed(cursorPosition))
+                return nonEmpty;
+            else if (ifS->thenbody->location.containsClosed(cursorPosition))
+                return empty;
+            else if (auto elseS = ifS->elsebody)
+            {
+                if (auto elseIf = ifS->elsebody->as<AstStatIf>())
+                {
+
+                    if (elseIf->thenbody->hasEnd)
+                        return empty;
+                    else
+                        return {elseS->location.begin, cursorPosition};
+                }
+                return empty;
+            }
+        }
+
+        return nonEmpty;
+    }
+    return empty;
+}
+
+struct NearestStatementFinder : public AstVisitor
+{
+    explicit NearestStatementFinder(const Position& cursorPosition)
+        : cursor(cursorPosition)
+    {
+    }
+
+    bool visit(AstStatBlock* block) override
+    {
+        if (block->location.containsClosed(cursor))
+        {
+            parent = block;
+            for (auto v : block->body)
+            {
+                if (v->location.begin <= cursor)
+                {
+                    nearest = v;
+                }
+            }
+            return true;
+        }
+        else
+            return false;
+    }
+
+    const Position& cursor;
+    AstStat* nearest = nullptr;
+    AstStatBlock* parent = nullptr;
+};
+
+// This struct takes a block found in a updated AST and looks for the corresponding block in a different ast.
+// This is a best effort check - we are looking for the block that is as close in location, ideally the same
+// block as the one from the updated AST
+struct NearestLikelyBlockFinder : public AstVisitor
+{
+    explicit NearestLikelyBlockFinder(NotNull<AstStatBlock> stmtBlockRecentAst)
+        : stmtBlockRecentAst(stmtBlockRecentAst)
+    {
+    }
+
+    bool visit(AstStatBlock* block) override
+    {
+        if (block->location.begin <= stmtBlockRecentAst->location.begin)
+        {
+            if (found)
+            {
+                if (found.value()->location.begin < block->location.begin)
+                    found.emplace(block);
+            }
+            else
+            {
+                found.emplace(block);
+            }
+        }
+
+        return true;
+    }
+    NotNull<AstStatBlock> stmtBlockRecentAst;
+    std::optional<AstStatBlock*> found = std::nullopt;
+};
+
+// Diffs two ast stat blocks. Once at the first difference, consume between that range and the end of the nearest statement
+std::optional<Position> blockDiffStart(AstStatBlock* blockOld, AstStatBlock* blockNew, AstStat* nearestStatementNewAst)
+{
+    AstArray<AstStat*> _old = blockOld->body;
+    AstArray<AstStat*> _new = blockNew->body;
+    size_t oldSize = _old.size;
+    size_t stIndex = 0;
+
+    // We couldn't find a nearest statement
+    if (nearestStatementNewAst == blockNew)
+        return std::nullopt;
+    bool found = false;
+    for (auto st : _new)
+    {
+        if (st == nearestStatementNewAst)
+        {
+            found = true;
+            break;
+        }
+        stIndex++;
+    }
+
+    if (!found)
+        return std::nullopt;
+    // Take care of some easy cases!
+    if (oldSize == 0 && _new.size >= 0)
+        return {_new.data[0]->location.begin};
+
+    if (_new.size < oldSize)
+        return std::nullopt;
+
+    for (size_t i = 0; i < std::min(oldSize, stIndex + 1); i++)
+    {
+        AstStat* oldStat = _old.data[i];
+        AstStat* newStat = _new.data[i];
+
+        bool isSame = oldStat->classIndex == newStat->classIndex && oldStat->location == newStat->location;
+        if (!isSame)
+            return {oldStat->location.begin};
+    }
+
+    if (oldSize <= stIndex)
+        return {_new.data[oldSize]->location.begin};
+
+    return std::nullopt;
+}
+
+
+FragmentRegion getFragmentRegion(AstStatBlock* root, const Position& cursorPosition)
+{
+    NearestStatementFinder nsf{cursorPosition};
+    root->visit(&nsf);
+    AstStatBlock* parent = root;
+    if (nsf.parent)
+        parent = nsf.parent;
+    return FragmentRegion{getFragmentLocation(nsf.nearest, cursorPosition), nsf.nearest, parent};
+};
+
+FragmentRegion getFragmentRegionWithBlockDiff(AstStatBlock* stale, AstStatBlock* fresh, const Position& cursorPos)
+{
+    // Visit the new ast
+    NearestStatementFinder nsf{cursorPos};
+    fresh->visit(&nsf);
+    // parent must always be non-null
+    NotNull<AstStatBlock> parent{nsf.parent ? nsf.parent : fresh};
+    NotNull<AstStat> nearest{nsf.nearest ? nsf.nearest : fresh};
+    // Grab the same start block in the stale ast
+    NearestLikelyBlockFinder lsf{parent};
+    stale->visit(&lsf);
+
+    if (auto sameBlock = lsf.found)
+    {
+        if (std::optional<Position> fd = blockDiffStart(*sameBlock, parent, nearest))
+            return FragmentRegion{Location{*fd, cursorPos}, nearest, parent};
+    }
+    return FragmentRegion{getFragmentLocation(nsf.nearest, cursorPos), nearest, parent};
+}
+
+FragmentAutocompleteAncestryResult findAncestryForFragmentParse(AstStatBlock* stale, const Position& cursorPos, AstStatBlock* lastGoodParse)
+{
+    // the freshest ast can sometimes be null if the parse was bad.
+    if (lastGoodParse == nullptr)
+        return {};
+    FragmentRegion region = FFlag::LuauBlockDiffFragmentSelection ? getFragmentRegionWithBlockDiff(stale, lastGoodParse, cursorPos)
+                                                                  : getFragmentRegion(lastGoodParse, cursorPos);
+    std::vector<AstNode*> ancestry = findAncestryAtPositionForAutocomplete(stale, cursorPos);
+    LUAU_ASSERT(ancestry.size() >= 1);
+    // We should only pick up locals that are before the region
+    DenseHashMap<AstName, AstLocal*> localMap{AstName()};
+    std::vector<AstLocal*> localStack;
+
+    for (AstNode* node : ancestry)
+    {
+        if (auto block = node->as<AstStatBlock>())
+        {
+            for (auto stat : block->body)
+            {
+                if (stat->location.begin < region.fragmentLocation.begin)
+                {
+                    // This statement precedes the current one
+                    if (auto statLoc = stat->as<AstStatLocal>())
+                    {
+                        for (auto v : statLoc->vars)
+                        {
+                            localStack.push_back(v);
+                            localMap[v->name] = v;
+                        }
+                    }
+                    else if (auto locFun = stat->as<AstStatLocalFunction>())
+                    {
+                        localStack.push_back(locFun->name);
+                        localMap[locFun->name->name] = locFun->name;
+                        if (locFun->location.contains(cursorPos))
+                        {
+                            for (AstLocal* loc : locFun->func->args)
+                            {
+                                localStack.push_back(loc);
+                                localMap[loc->name] = loc;
+                            }
+                        }
+                    }
+                    else if (auto globFun = stat->as<AstStatFunction>())
+                    {
+                        if (globFun->location.contains(cursorPos))
+                        {
+                            for (AstLocal* loc : globFun->func->args)
+                            {
+                                localStack.push_back(loc);
+                                localMap[loc->name] = loc;
+                            }
+                        }
+                    }
+                    else if (auto typeFun = stat->as<AstStatTypeFunction>(); typeFun)
+                    {
+                        if (typeFun->location.contains(cursorPos))
+                        {
+                            for (AstLocal* loc : typeFun->body->args)
+                            {
+                                localStack.push_back(loc);
+                                localMap[loc->name] = loc;
+                            }
+                        }
+                    }
+                    else if (auto forL = stat->as<AstStatFor>())
+                    {
+                        if (forL->var && forL->var->location.begin < region.fragmentLocation.begin)
+                        {
+                            localStack.push_back(forL->var);
+                            localMap[forL->var->name] = forL->var;
+                        }
+                    }
+                    else if (auto forIn = stat->as<AstStatForIn>())
+                    {
+                        for (auto var : forIn->vars)
+                        {
+                            if (var->location.begin < region.fragmentLocation.begin)
+                            {
+                                localStack.push_back(var);
+                                localMap[var->name] = var;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (auto exprFunc = node->as<AstExprFunction>())
+        {
+            if (exprFunc->location.contains(cursorPos))
+            {
+                for (auto v : exprFunc->args)
+                {
+                    localStack.push_back(v);
+                    localMap[v->name] = v;
+                }
+            }
+        }
+    }
+
+    return {localMap, localStack, ancestry, region.nearestStatement, region.parentBlock, region.fragmentLocation};
+}
+
+std::optional<FragmentParseResult> parseFragment(
+    AstStatBlock* stale,
+    AstStatBlock* mostRecentParse,
+    AstNameTable* names,
+    std::string_view src,
+    const Position& cursorPos,
+    std::optional<Position> fragmentEndPosition
+)
+{
+    if (mostRecentParse == nullptr)
+        return std::nullopt;
+    FragmentAutocompleteAncestryResult result = findAncestryForFragmentParse(stale, cursorPos, mostRecentParse);
+    AstStat* nearestStatement = result.nearestStatement;
+
+    Position startPos = result.fragmentSelectionRegion.begin;
+    Position endPos = fragmentEndPosition.value_or(result.fragmentSelectionRegion.end);
+
+    auto [offsetStart, parseLength] = getDocumentOffsets(src, startPos, endPos);
+    const char* srcStart = src.data() + offsetStart;
+    std::string_view dbg = src.substr(offsetStart, parseLength);
+    FragmentParseResult fragmentResult;
+    fragmentResult.fragmentToParse = std::string(dbg);
+    // For the duration of the incremental parse, we want to allow the name table to re-use duplicate names
+    if (FFlag::DebugLogFragmentsFromAutocomplete)
+        logLuau("Fragment Selected", dbg);
+
+    ParseOptions opts;
+    opts.allowDeclarationSyntax = false;
+    opts.captureComments = true;
+    opts.parseFragment = FragmentParseResumeSettings{std::move(result.localMap), std::move(result.localStack), startPos};
+    ParseResult p = Luau::Parser::parse(srcStart, parseLength, *names, *fragmentResult.alloc, opts);
+    // This means we threw a ParseError and we should decline to offer autocomplete here.
+    if (p.root == nullptr)
+        return std::nullopt;
+
+    std::vector<AstNode*> fabricatedAncestry = std::move(result.ancestry);
+    std::vector<AstNode*> fragmentAncestry = findAncestryAtPositionForAutocomplete(p.root, cursorPos);
+    fabricatedAncestry.insert(fabricatedAncestry.end(), fragmentAncestry.begin(), fragmentAncestry.end());
+    if (nearestStatement == nullptr)
+        nearestStatement = p.root;
+    fragmentResult.root = p.root;
+    fragmentResult.ancestry = std::move(fabricatedAncestry);
+    fragmentResult.nearestStatement = nearestStatement;
+    fragmentResult.commentLocations = std::move(p.commentLocations);
+    fragmentResult.scopePos = result.parentBlock->location.begin;
+    return fragmentResult;
+}
+
 struct UsageFinder : public AstVisitor
 {
 
@@ -112,6 +542,11 @@ struct UsageFinder : public AstVisitor
     bool visit(AstType* node) override
     {
         return true;
+    }
+
+    bool visit(AstTypePack* node) override
+    {
+        return FFlag::LuauStoreReturnTypesAsPackOnAst;
     }
 
     bool visit(AstStatTypeAlias* alias) override
@@ -141,12 +576,32 @@ struct UsageFinder : public AstVisitor
         return true;
     }
 
+    bool visit(AstExprGlobal* global) override
+    {
+        if (FFlag::LuauGlobalVariableModuleIsolation)
+            globalDefsToPrePopulate.emplace_back(global->name, dfg->getDef(global));
+        return true;
+    }
+
+    bool visit(AstStatFunction* function) override
+    {
+        if (FFlag::LuauGlobalVariableModuleIsolation)
+        {
+            if (AstExprGlobal* g = function->name->as<AstExprGlobal>())
+                globalFunctionsReferenced.emplace_back(g->name);
+        }
+
+        return true;
+    }
+
     NotNull<DataFlowGraph> dfg;
     DenseHashSet<Name> declaredAliases{""};
     std::vector<std::pair<const Def*, AstLocal*>> localBindingsReferenced;
     DenseHashSet<const Def*> mentionedDefs{nullptr};
     std::vector<Name> referencedBindings{""};
     std::vector<std::pair<Name, Name>> referencedImportedBindings{{"", ""}};
+    std::vector<std::pair<AstName, const Def*>> globalDefsToPrePopulate;
+    std::vector<AstName> globalFunctionsReferenced;
 };
 
 // Runs the `UsageFinder` traversal on the fragment and grabs all of the types that are
@@ -158,6 +613,7 @@ void cloneTypesFromFragment(
     const ModulePtr& staleModule,
     NotNull<TypeArena> destArena,
     NotNull<DataFlowGraph> dfg,
+    NotNull<BuiltinTypes> builtins,
     AstStatBlock* program,
     Scope* destScope
 )
@@ -188,6 +644,13 @@ void cloneTypesFromFragment(
             destScope->lvalueTypes[d] = Luau::cloneIncremental(pair->second.typeId, *destArena, cloneState, destScope);
             destScope->bindings[pair->first] = Luau::cloneIncremental(pair->second, *destArena, cloneState, destScope);
         }
+        else if (FFlag::LuauBetterScopeSelection && !FFlag::LuauBlockDiffFragmentSelection)
+        {
+            destScope->lvalueTypes[d] = builtins->unknownType;
+            Binding b;
+            b.typeId = builtins->unknownType;
+            destScope->bindings[Symbol(loc)] = b;
+        }
     }
 
     // Second - any referenced type alias bindings need to be placed in scope so type annotation can be resolved.
@@ -212,7 +675,45 @@ void cloneTypesFromFragment(
         }
     }
 
-    // Finally - clone the returnType on the staleScope. This helps avoid potential leaks of free types.
+    if (FFlag::LuauGlobalVariableModuleIsolation)
+    {
+        // Fourth  - prepopulate the global function types
+        for (const auto& name : f.globalFunctionsReferenced)
+        {
+            if (auto ty = staleModule->getModuleScope()->lookup(name))
+            {
+                destScope->bindings[name] = Binding{Luau::cloneIncremental(*ty, *destArena, cloneState, destScope)};
+            }
+            else
+            {
+                TypeId bt = destArena->addType(BlockedType{});
+                destScope->bindings[name] = Binding{bt};
+            }
+        }
+
+        // Fifth  - prepopulate the globals here
+        for (const auto& [name, def] : f.globalDefsToPrePopulate)
+        {
+            if (auto ty = staleModule->getModuleScope()->lookup(name))
+            {
+                destScope->lvalueTypes[def] = Luau::cloneIncremental(*ty, *destArena, cloneState, destScope);
+            }
+            else if (auto ty = destScope->lookup(name))
+            {
+                // This branch is a little strange - we are looking up a symbol in the destScope
+                // This scope has no parent pointer, and only cloned types are written to it, so this is a
+                // safe operation to do without cloning.
+                // The reason we do this, is the usage finder will traverse the global functions referenced first
+                // If there is no name associated with this function at the global scope, it must appear first in the fragment and we must
+                // create a blocked type for it. We write this blocked type directly into the `destScope` bindings
+                // Then when we go to traverse the `AstExprGlobal` associated with this function, we need to ensure that we map the def -> blockedType
+                // in `lvalueTypes`, which was previously written into `destScope`
+                destScope->lvalueTypes[def] = *ty;
+            }
+        }
+    }
+
+    // Finally, clone the returnType on the staleScope. This helps avoid potential leaks of free types.
     if (staleScope->returnType)
         destScope->returnType = Luau::cloneIncremental(staleScope->returnType, *destArena, cloneState, destScope);
 }
@@ -234,7 +735,7 @@ struct MixedModeIncrementalTCDefFinder : public AstVisitor
         // requires that we find the local/global `m` and place it in the environment.
         // The default behaviour here is to return false, and have individual visitors override
         // the specific behaviour they need.
-        return FFlag::LuauMixedModeDefFinderTraversesTypeOf;
+        return true;
     }
 
     bool visit(AstStatTypeAlias* alias) override
@@ -384,7 +885,7 @@ void cloneAndSquashScopes(
         }
     }
 
-    if (FFlag::LuauCloneReturnTypePack && destScope->returnType)
+    if (destScope->returnType)
         destScope->returnType = Luau::cloneIncremental(destScope->returnType, *destArena, cloneState, destScope);
 
     return;
@@ -400,15 +901,10 @@ static FrontendModuleResolver& getModuleResolver(Frontend& frontend, std::option
 
 bool statIsBeforePos(const AstNode* stat, const Position& cursorPos)
 {
-    if (FFlag::LuauIncrementalAutocompleteBugfixes)
-    {
-        return (stat->location.begin < cursorPos);
-    }
-
-    return stat->location.begin < cursorPos && stat->location.begin.line < cursorPos.line;
+    return (stat->location.begin < cursorPos);
 }
 
-FragmentAutocompleteAncestryResult findAncestryForFragmentParse(AstStatBlock* root, const Position& cursorPos)
+FragmentAutocompleteAncestryResult findAncestryForFragmentParse_DEPRECATED(AstStatBlock* root, const Position& cursorPos)
 {
     std::vector<AstNode*> ancestry = findAncestryAtPositionForAutocomplete(root, cursorPos);
     // Should always contain the root AstStat
@@ -437,7 +933,7 @@ FragmentAutocompleteAncestryResult findAncestryForFragmentParse(AstStatBlock* ro
         {
             for (auto stat : block->body)
             {
-                if (statIsBeforePos(stat, FFlag::LuauIncrementalAutocompleteBugfixes ? nearestStatement->location.begin : cursorPos))
+                if (statIsBeforePos(stat, nearestStatement->location.begin))
                 {
                     // This statement precedes the current one
                     if (auto statLoc = stat->as<AstStatLocal>())
@@ -486,17 +982,14 @@ FragmentAutocompleteAncestryResult findAncestryForFragmentParse(AstStatBlock* ro
                 }
             }
         }
-        if (FFlag::LuauIncrementalAutocompleteBugfixes)
+        if (auto exprFunc = node->as<AstExprFunction>())
         {
-            if (auto exprFunc = node->as<AstExprFunction>())
+            if (exprFunc->location.contains(cursorPos))
             {
-                if (exprFunc->location.contains(cursorPos))
+                for (auto v : exprFunc->args)
                 {
-                    for (auto v : exprFunc->args)
-                    {
-                        localStack.push_back(v);
-                        localMap[v->name] = v;
-                    }
+                    localStack.push_back(v);
+                    localMap[v->name] = v;
                 }
             }
         }
@@ -513,7 +1006,7 @@ FragmentAutocompleteAncestryResult findAncestryForFragmentParse(AstStatBlock* ro
  * Example - your document is "foo bar baz" and getDocumentOffsets is passed (0, 4), (0, 8). This function returns the pair {3, 5}
  * which corresponds to the string " bar "
  */
-std::pair<size_t, size_t> getDocumentOffsets(const std::string_view& src, const Position& startPos, const Position& endPos)
+static std::pair<size_t, size_t> getDocumentOffsets(std::string_view src, const Position& startPos, const Position& endPos)
 {
     size_t lineCount = 0;
     size_t colCount = 0;
@@ -570,14 +1063,14 @@ std::pair<size_t, size_t> getDocumentOffsets(const std::string_view& src, const 
     return {min, len};
 }
 
-ScopePtr findClosestScope(const ModulePtr& module, const AstStat* nearestStatement)
+ScopePtr findClosestScope_DEPRECATED(const ModulePtr& module, const AstStat* nearestStatement)
 {
     LUAU_ASSERT(module->hasModuleScope());
 
     ScopePtr closest = module->getModuleScope();
 
     // find the scope the nearest statement belonged to.
-    for (auto [loc, sc] : module->scopes)
+    for (const auto& [loc, sc] : module->scopes)
     {
         if (loc.encloses(nearestStatement->location) && closest->location.begin <= loc.begin)
             closest = sc;
@@ -586,7 +1079,38 @@ ScopePtr findClosestScope(const ModulePtr& module, const AstStat* nearestStateme
     return closest;
 }
 
-std::optional<FragmentParseResult> parseFragment(
+ScopePtr findClosestScope(const ModulePtr& module, const Position& scopePos)
+{
+    LUAU_ASSERT(module->hasModuleScope());
+    if (FFlag::LuauBlockDiffFragmentSelection)
+    {
+        ScopePtr closest = module->getModuleScope();
+        // find the scope the nearest statement belonged to.
+        for (const auto& [loc, sc] : module->scopes)
+        {
+            // We bias towards the later scopes because those correspond to inner scopes.
+            // in the case of if statements, we create two scopes at the same location for the body of the then
+            // and else branches, so we need to bias later. This is why the closest update condition has a <=
+            // instead of a <
+            if (sc->location.contains(scopePos) && closest->location.begin <= sc->location.begin)
+                closest = sc;
+        }
+        return closest;
+    }
+    else
+    {
+        ScopePtr closest = module->getModuleScope();
+        // find the scope the nearest statement belonged to.
+        for (const auto& [loc, sc] : module->scopes)
+        {
+            if (sc->location.contains(scopePos) && closest->location.begin < sc->location.begin)
+                closest = sc;
+        }
+        return closest;
+    }
+}
+
+std::optional<FragmentParseResult> parseFragment_DEPRECATED(
     AstStatBlock* root,
     AstNameTable* names,
     std::string_view src,
@@ -594,7 +1118,7 @@ std::optional<FragmentParseResult> parseFragment(
     std::optional<Position> fragmentEndPosition
 )
 {
-    FragmentAutocompleteAncestryResult result = findAncestryForFragmentParse(root, cursorPos);
+    FragmentAutocompleteAncestryResult result = findAncestryForFragmentParse_DEPRECATED(root, cursorPos);
     AstStat* nearestStatement = result.nearestStatement;
 
     const Location& rootSpan = root->location;
@@ -625,8 +1149,8 @@ std::optional<FragmentParseResult> parseFragment(
     FragmentParseResult fragmentResult;
     fragmentResult.fragmentToParse = std::string(dbg.data(), parseLength);
     // For the duration of the incremental parse, we want to allow the name table to re-use duplicate names
-    if (FFlag::LogFragmentsFromAutocomplete)
-        logLuau(dbg);
+    if (FFlag::DebugLogFragmentsFromAutocomplete)
+        logLuau("Fragment Selected", dbg);
 
     ParseOptions opts;
     opts.allowDeclarationSyntax = false;
@@ -701,31 +1225,6 @@ ModulePtr cloneModule(CloneState& cloneState, const ModulePtr& source, std::uniq
     return incremental;
 }
 
-ModulePtr copyModule(const ModulePtr& result, std::unique_ptr<Allocator> alloc)
-{
-    ModulePtr incrementalModule = std::make_shared<Module>();
-    incrementalModule->name = result->name;
-    incrementalModule->humanReadableName = "Incremental$" + result->humanReadableName;
-    incrementalModule->internalTypes.owningModule = incrementalModule.get();
-    incrementalModule->interfaceTypes.owningModule = incrementalModule.get();
-    incrementalModule->allocator = std::move(alloc);
-    // Don't need to keep this alive (it's already on the source module)
-    copyModuleVec(incrementalModule->scopes, result->scopes);
-    copyModuleMap(incrementalModule->astTypes, result->astTypes);
-    copyModuleMap(incrementalModule->astTypePacks, result->astTypePacks);
-    copyModuleMap(incrementalModule->astExpectedTypes, result->astExpectedTypes);
-    // Don't need to clone astOriginalCallTypes
-    copyModuleMap(incrementalModule->astOverloadResolvedTypes, result->astOverloadResolvedTypes);
-    // Don't need to clone astForInNextTypes
-    copyModuleMap(incrementalModule->astForInNextTypes, result->astForInNextTypes);
-    // Don't need to clone astResolvedTypes
-    // Don't need to clone astResolvedTypePacks
-    // Don't need to clone upperBoundContributors
-    copyModuleMap(incrementalModule->astScopes, result->astScopes);
-    // Don't need to clone declared Globals;
-    return incrementalModule;
-}
-
 void mixedModeCompatibility(
     const ScopePtr& bottomScopeStale,
     const ScopePtr& myFakeScope,
@@ -754,7 +1253,7 @@ void mixedModeCompatibility(
 
 static void reportWaypoint(IFragmentAutocompleteReporter* reporter, FragmentAutocompleteWaypoint type)
 {
-    if (!FFlag::LuauFragmentAcSupportsReporter || !reporter)
+    if (!reporter)
         return;
 
     reporter->reportWaypoint(type);
@@ -762,7 +1261,7 @@ static void reportWaypoint(IFragmentAutocompleteReporter* reporter, FragmentAuto
 
 static void reportFragmentString(IFragmentAutocompleteReporter* reporter, std::string_view fragment)
 {
-    if (!FFlag::LuauFragmentAcSupportsReporter || !reporter)
+    if (!reporter)
         return;
 
     reporter->reportFragmentString(fragment);
@@ -789,10 +1288,8 @@ FragmentTypeCheckResult typecheckFragmentHelper_DEPRECATED(
     ModulePtr incrementalModule = nullptr;
     if (FFlag::LuauAllFreeTypesHaveScopes)
         incrementalModule = cloneModule(cloneState, stale, std::move(astAllocator), freshChildOfNearestScope.get());
-    else if (FFlag::LuauCloneIncrementalModule)
-        incrementalModule = cloneModule_DEPRECATED(cloneState, stale, std::move(astAllocator));
     else
-        incrementalModule = copyModule(stale, std::move(astAllocator));
+        incrementalModule = cloneModule_DEPRECATED(cloneState, stale, std::move(astAllocator));
 
     reportWaypoint(reporter, FragmentAutocompleteWaypoint::CloneModuleEnd);
     incrementalModule->checkedInNewSolver = true;
@@ -846,44 +1343,27 @@ FragmentTypeCheckResult typecheckFragmentHelper_DEPRECATED(
     };
 
     reportWaypoint(reporter, FragmentAutocompleteWaypoint::CloneAndSquashScopeStart);
-    if (FFlag::LuauCloneIncrementalModule)
-    {
-        incrementalModule->scopes.emplace_back(root->location, freshChildOfNearestScope);
-        cg.rootScope = freshChildOfNearestScope.get();
+    incrementalModule->scopes.emplace_back(root->location, freshChildOfNearestScope);
+    cg.rootScope = freshChildOfNearestScope.get();
 
-        if (FFlag::LuauAllFreeTypesHaveScopes)
-            cloneAndSquashScopes(
-                cloneState, closestScope.get(), stale, NotNull{&incrementalModule->internalTypes}, NotNull{&dfg}, root, freshChildOfNearestScope.get()
-            );
-        else
-            cloneAndSquashScopes_DEPRECATED(
-                cloneState, closestScope.get(), stale, NotNull{&incrementalModule->internalTypes}, NotNull{&dfg}, root, freshChildOfNearestScope.get()
-            );
-
-        reportWaypoint(reporter, FragmentAutocompleteWaypoint::CloneAndSquashScopeEnd);
-        cg.visitFragmentRoot(freshChildOfNearestScope, root);
-
-        if (FFlag::LuauPersistConstraintGenerationScopes)
-        {
-            for (auto p : cg.scopes)
-                incrementalModule->scopes.emplace_back(std::move(p));
-        }
-    }
+    if (FFlag::LuauAllFreeTypesHaveScopes)
+        cloneAndSquashScopes(
+            cloneState, closestScope.get(), stale, NotNull{&incrementalModule->internalTypes}, NotNull{&dfg}, root, freshChildOfNearestScope.get()
+        );
     else
+        cloneAndSquashScopes_DEPRECATED(
+            cloneState, closestScope.get(), stale, NotNull{&incrementalModule->internalTypes}, NotNull{&dfg}, root, freshChildOfNearestScope.get()
+        );
+
+    reportWaypoint(reporter, FragmentAutocompleteWaypoint::CloneAndSquashScopeEnd);
+    cg.visitFragmentRoot(freshChildOfNearestScope, root);
+
+    if (FFlag::LuauPersistConstraintGenerationScopes)
     {
-        // Any additions to the scope must occur in a fresh scope
-        cg.rootScope = stale->getModuleScope().get();
-        incrementalModule->scopes.emplace_back(root->location, freshChildOfNearestScope);
-        mixedModeCompatibility(closestScope, freshChildOfNearestScope, stale, NotNull{&dfg}, root);
-        // closest Scope -> children = { ...., freshChildOfNearestScope}
-        // We need to trim nearestChild from the scope hierarchy
-        closestScope->children.emplace_back(freshChildOfNearestScope.get());
-        cg.visitFragmentRoot(freshChildOfNearestScope, root);
-        // Trim nearestChild from the closestScope
-        Scope* back = closestScope->children.back().get();
-        LUAU_ASSERT(back == freshChildOfNearestScope.get());
-        closestScope->children.pop_back();
+        for (auto p : cg.scopes)
+            incrementalModule->scopes.emplace_back(std::move(p));
     }
+
     reportWaypoint(reporter, FragmentAutocompleteWaypoint::ConstraintSolverStart);
 
     if (FFlag::LuauAllFreeTypesHaveScopes)
@@ -892,6 +1372,8 @@ FragmentTypeCheckResult typecheckFragmentHelper_DEPRECATED(
         {
             if (!sc->interiorFreeTypes.has_value())
                 sc->interiorFreeTypes.emplace();
+            if (!sc->interiorFreeTypePacks.has_value())
+                sc->interiorFreeTypePacks.emplace();
         }
     }
 
@@ -991,7 +1473,7 @@ FragmentTypeCheckResult typecheckFragment_(
     SimplifierPtr simplifier = newSimplifier(NotNull{&incrementalModule->internalTypes}, frontend.builtinTypes);
 
     FrontendModuleResolver& resolver = getModuleResolver(frontend, opts);
-
+    std::shared_ptr<Scope> freshChildOfNearestScope = std::make_shared<Scope>(nullptr);
     /// Contraint Generator
     ConstraintGenerator cg{
         incrementalModule,
@@ -1001,7 +1483,7 @@ FragmentTypeCheckResult typecheckFragment_(
         NotNull{&resolver},
         frontend.builtinTypes,
         iceHandler,
-        stale->getModuleScope(),
+        FFlag::LuauGlobalVariableModuleIsolation ? freshChildOfNearestScope : stale->getModuleScope(),
         frontend.globals.globalTypeFunctionScope,
         nullptr,
         nullptr,
@@ -1010,9 +1492,9 @@ FragmentTypeCheckResult typecheckFragment_(
     };
 
     CloneState cloneState{frontend.builtinTypes};
-    std::shared_ptr<Scope> freshChildOfNearestScope = std::make_shared<Scope>(nullptr);
     incrementalModule->scopes.emplace_back(root->location, freshChildOfNearestScope);
     freshChildOfNearestScope->interiorFreeTypes.emplace();
+    freshChildOfNearestScope->interiorFreeTypePacks.emplace();
     cg.rootScope = freshChildOfNearestScope.get();
 
     if (FFlag::LuauUserTypeFunTypecheck)
@@ -1025,7 +1507,14 @@ FragmentTypeCheckResult typecheckFragment_(
 
     reportWaypoint(reporter, FragmentAutocompleteWaypoint::CloneAndSquashScopeStart);
     cloneTypesFromFragment(
-        cloneState, closestScope.get(), stale, NotNull{&incrementalModule->internalTypes}, NotNull{&dfg}, root, freshChildOfNearestScope.get()
+        cloneState,
+        closestScope.get(),
+        stale,
+        NotNull{&incrementalModule->internalTypes},
+        NotNull{&dfg},
+        frontend.builtinTypes,
+        root,
+        freshChildOfNearestScope.get()
     );
     reportWaypoint(reporter, FragmentAutocompleteWaypoint::CloneAndSquashScopeEnd);
 
@@ -1086,6 +1575,7 @@ std::pair<FragmentTypeCheckStatus, FragmentTypeCheckResult> typecheckFragment(
     std::optional<FrontendOptions> opts,
     std::string_view src,
     std::optional<Position> fragmentEndPosition,
+    AstStatBlock* recentParse,
     IFragmentAutocompleteReporter* reporter
 )
 {
@@ -1104,30 +1594,9 @@ std::pair<FragmentTypeCheckStatus, FragmentTypeCheckResult> typecheckFragment(
     }
 
     std::optional<FragmentParseResult> tryParse;
-    if (FFlag::LuauModuleHoldsAstRoot)
-    {
-        tryParse = parseFragment(module->root, module->names.get(), src, cursorPos, fragmentEndPosition);
-    }
-    else
-    {
-        const SourceModule* sourceModule = frontend.getSourceModule(moduleName);
-        if (!sourceModule)
-        {
-            LUAU_ASSERT(!"Expected Source Module for fragment typecheck");
-            return {};
-        }
+    tryParse = FFlag::LuauBetterScopeSelection ? parseFragment(module->root, recentParse, module->names.get(), src, cursorPos, fragmentEndPosition)
+                                               : parseFragment_DEPRECATED(module->root, module->names.get(), src, cursorPos, fragmentEndPosition);
 
-        if (FFlag::LuauIncrementalAutocompleteBugfixes)
-        {
-            if (sourceModule->allocator.get() != module->allocator.get())
-            {
-                return {FragmentTypeCheckStatus::SkipAutocomplete, {}};
-            }
-        }
-
-        tryParse = parseFragment(sourceModule->root, sourceModule->names.get(), src, cursorPos, fragmentEndPosition);
-        reportWaypoint(reporter, FragmentAutocompleteWaypoint::ParseFragmentEnd);
-    }
 
     if (!tryParse)
         return {FragmentTypeCheckStatus::SkipAutocomplete, {}};
@@ -1138,7 +1607,8 @@ std::pair<FragmentTypeCheckStatus, FragmentTypeCheckResult> typecheckFragment(
         return {FragmentTypeCheckStatus::SkipAutocomplete, {}};
 
     FrontendOptions frontendOptions = opts.value_or(frontend.options);
-    const ScopePtr& closestScope = findClosestScope(module, parseResult.nearestStatement);
+    const ScopePtr& closestScope = FFlag::LuauBetterScopeSelection ? findClosestScope(module, parseResult.scopePos)
+                                                                   : findClosestScope_DEPRECATED(module, parseResult.nearestStatement);
     FragmentTypeCheckResult result =
         FFlag::LuauIncrementalAutocompleteDemandBasedCloning
             ? typecheckFragment_(frontend, parseResult.root, module, closestScope, cursorPos, std::move(parseResult.alloc), frontendOptions, reporter)
@@ -1174,14 +1644,15 @@ FragmentAutocompleteStatusResult tryFragmentAutocomplete(
             context.opts,
             std::move(stringCompletionCB),
             context.DEPRECATED_fragmentEndPosition,
-            FFlag::LuauFragmentAcSupportsReporter ? context.reporter : nullptr
+            context.freshParse.root,
+            context.reporter
         );
         return {FragmentAutocompleteStatus::Success, std::move(fragmentAutocomplete)};
     }
     catch (const Luau::InternalCompilerError& e)
     {
-        if (FFlag::LogFragmentsFromAutocomplete)
-            logLuau(e.what());
+        if (FFlag::DebugLogFragmentsFromAutocomplete)
+            logLuau("tryFragmentAutocomplete exception", e.what());
         return {FragmentAutocompleteStatus::InternalIce, std::nullopt};
     }
 }
@@ -1194,40 +1665,28 @@ FragmentAutocompleteResult fragmentAutocomplete(
     std::optional<FrontendOptions> opts,
     StringCompletionCallback callback,
     std::optional<Position> fragmentEndPosition,
+    AstStatBlock* recentParse,
     IFragmentAutocompleteReporter* reporter
 )
 {
-    LUAU_ASSERT(FFlag::LuauAutocompleteRefactorsForIncrementalAutocomplete);
     LUAU_TIMETRACE_SCOPE("Luau::fragmentAutocomplete", "FragmentAutocomplete");
     LUAU_TIMETRACE_ARGUMENT("name", moduleName.c_str());
 
-    if (!FFlag::LuauModuleHoldsAstRoot)
-    {
-        const SourceModule* sourceModule = frontend.getSourceModule(moduleName);
-        if (!sourceModule)
-        {
-            LUAU_ASSERT(!"Expected Source Module for fragment typecheck");
-            return {};
-        }
-
-        // If the cursor is within a comment in the stale source module we should avoid providing a recommendation
-        if (isWithinComment(*sourceModule, fragmentEndPosition.value_or(cursorPosition)))
-            return {};
-    }
-
-    auto [tcStatus, tcResult] = typecheckFragment(frontend, moduleName, cursorPosition, opts, src, fragmentEndPosition, reporter);
+    auto [tcStatus, tcResult] = typecheckFragment(frontend, moduleName, cursorPosition, opts, src, fragmentEndPosition, recentParse, reporter);
     if (tcStatus == FragmentTypeCheckStatus::SkipAutocomplete)
         return {};
 
     reportWaypoint(reporter, FragmentAutocompleteWaypoint::TypecheckFragmentEnd);
     auto globalScope = (opts && opts->forAutocomplete) ? frontend.globalsForAutocomplete.globalScope.get() : frontend.globals.globalScope.get();
-    if (FFlag::LogFragmentsFromAutocomplete)
-        logLuau(src);
-    TypeArena arenaForFragmentAutocomplete;
+    if (FFlag::DebugLogFragmentsFromAutocomplete)
+        logLuau("Fragment Autocomplete Source Script", src);
+    TypeArena arenaForAutocomplete_DEPRECATED;
+    if (FFlag::LuauFragmentAcMemoryLeak)
+        unfreeze(tcResult.incrementalModule->internalTypes);
     auto result = Luau::autocomplete_(
         tcResult.incrementalModule,
         frontend.builtinTypes,
-        &arenaForFragmentAutocomplete,
+        FFlag::LuauFragmentAcMemoryLeak ? &tcResult.incrementalModule->internalTypes : &arenaForAutocomplete_DEPRECATED,
         tcResult.ancestry,
         globalScope,
         tcResult.freshScope,
@@ -1235,9 +1694,10 @@ FragmentAutocompleteResult fragmentAutocomplete(
         frontend.fileResolver,
         callback
     );
-
+    if (FFlag::LuauFragmentAcMemoryLeak)
+        freeze(tcResult.incrementalModule->internalTypes);
     reportWaypoint(reporter, FragmentAutocompleteWaypoint::AutocompleteEnd);
-    return {std::move(tcResult.incrementalModule), tcResult.freshScope.get(), std::move(arenaForFragmentAutocomplete), std::move(result)};
+    return {std::move(tcResult.incrementalModule), tcResult.freshScope.get(), std::move(arenaForAutocomplete_DEPRECATED), std::move(result)};
 }
 
 } // namespace Luau

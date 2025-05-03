@@ -112,11 +112,12 @@ public:
 
     CstExprFunction();
 
-    Position openGenericsPosition{0,0};
+    Position functionKeywordPosition{0, 0};
+    Position openGenericsPosition{0, 0};
     AstArray<Position> genericsCommaPositions;
-    Position closeGenericsPosition{0,0};
+    Position closeGenericsPosition{0, 0};
     AstArray<Position> argsCommaPositions;
-    Position returnSpecifierPosition{0,0};
+    Position returnSpecifierPosition{0, 0};
 };
 
 class CstExprTable : public CstNode
@@ -274,13 +275,24 @@ public:
     Position opPosition;
 };
 
+class CstStatFunction : public CstNode
+{
+public:
+    LUAU_CST_RTTI(CstStatFunction)
+
+    explicit CstStatFunction(Position functionKeywordPosition);
+
+    Position functionKeywordPosition;
+};
+
 class CstStatLocalFunction : public CstNode
 {
 public:
     LUAU_CST_RTTI(CstStatLocalFunction)
 
-    explicit CstStatLocalFunction(Position functionKeywordPosition);
+    explicit CstStatLocalFunction(Position localKeywordPosition, Position functionKeywordPosition);
 
+    Position localKeywordPosition;
     Position functionKeywordPosition;
 };
 
@@ -376,6 +388,7 @@ public:
         std::optional<Position> separatorPosition;
 
         CstExprConstantString* stringInfo = nullptr; // only if Kind == StringProperty
+        Position stringPosition{0, 0}; // only if Kind == StringProperty
     };
 
     CstTypeTable(AstArray<Item> items, bool isArray);
@@ -421,6 +434,28 @@ public:
     Position closePosition;
 };
 
+class CstTypeUnion : public CstNode
+{
+public:
+    LUAU_CST_RTTI(CstTypeUnion)
+
+    CstTypeUnion(std::optional<Position> leadingPosition, AstArray<Position> separatorPositions);
+
+    std::optional<Position> leadingPosition;
+    AstArray<Position> separatorPositions;
+};
+
+class CstTypeIntersection : public CstNode
+{
+public:
+    LUAU_CST_RTTI(CstTypeIntersection)
+
+    explicit CstTypeIntersection(std::optional<Position> leadingPosition, AstArray<Position> separatorPositions);
+
+    std::optional<Position> leadingPosition;
+    AstArray<Position> separatorPositions;
+};
+
 class CstTypeSingletonString : public CstNode
 {
 public:
@@ -438,8 +473,10 @@ class CstTypePackExplicit : public CstNode
 public:
     LUAU_CST_RTTI(CstTypePackExplicit)
 
-    CstTypePackExplicit(Position openParenthesesPosition, Position closeParenthesesPosition, AstArray<Position> commaPositions);
+    explicit CstTypePackExplicit();
+    explicit CstTypePackExplicit(Position openParenthesesPosition, Position closeParenthesesPosition, AstArray<Position> commaPositions);
 
+    bool hasParentheses;
     Position openParenthesesPosition;
     Position closeParenthesesPosition;
     AstArray<Position> commaPositions;

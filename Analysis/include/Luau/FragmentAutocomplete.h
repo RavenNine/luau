@@ -49,6 +49,8 @@ struct FragmentAutocompleteAncestryResult
     std::vector<AstLocal*> localStack;
     std::vector<AstNode*> ancestry;
     AstStat* nearestStatement = nullptr;
+    AstStatBlock* parentBlock = nullptr;
+    Location fragmentSelectionRegion;
 };
 
 struct FragmentParseResult
@@ -59,6 +61,7 @@ struct FragmentParseResult
     AstStat* nearestStatement = nullptr;
     std::vector<Comment> commentLocations;
     std::unique_ptr<Allocator> alloc = std::make_unique<Allocator>();
+    Position scopePos{0, 0};
 };
 
 struct FragmentTypeCheckResult
@@ -72,14 +75,33 @@ struct FragmentAutocompleteResult
 {
     ModulePtr incrementalModule;
     Scope* freshScope;
-    TypeArena arenaForAutocomplete;
+    TypeArena arenaForAutocomplete_DEPRECATED;
     AutocompleteResult acResults;
 };
 
-FragmentAutocompleteAncestryResult findAncestryForFragmentParse(AstStatBlock* root, const Position& cursorPos);
+struct FragmentRegion
+{
+    Location fragmentLocation;
+    AstStat* nearestStatement = nullptr; // used for tests
+    AstStatBlock* parentBlock = nullptr; // used for scope detection
+};
+
+std::optional<Position> blockDiffStart(AstStatBlock* blockOld, AstStatBlock* blockNew, AstStat* nearestStatementNewAst);
+FragmentRegion getFragmentRegion(AstStatBlock* root, const Position& cursorPosition);
+FragmentAutocompleteAncestryResult findAncestryForFragmentParse(AstStatBlock* stale, const Position& cursorPos, AstStatBlock* lastGoodParse);
+FragmentAutocompleteAncestryResult findAncestryForFragmentParse_DEPRECATED(AstStatBlock* root, const Position& cursorPos);
+
+std::optional<FragmentParseResult> parseFragment_DEPRECATED(
+    AstStatBlock* root,
+    AstNameTable* names,
+    std::string_view src,
+    const Position& cursorPos,
+    std::optional<Position> fragmentEndPosition
+);
 
 std::optional<FragmentParseResult> parseFragment(
-    AstStatBlock* root,
+    AstStatBlock* stale,
+    AstStatBlock* mostRecentParse,
     AstNameTable* names,
     std::string_view src,
     const Position& cursorPos,
@@ -93,6 +115,7 @@ std::pair<FragmentTypeCheckStatus, FragmentTypeCheckResult> typecheckFragment(
     std::optional<FrontendOptions> opts,
     std::string_view src,
     std::optional<Position> fragmentEndPosition,
+    AstStatBlock* recentParse = nullptr,
     IFragmentAutocompleteReporter* reporter = nullptr
 );
 
@@ -104,6 +127,7 @@ FragmentAutocompleteResult fragmentAutocomplete(
     std::optional<FrontendOptions> opts,
     StringCompletionCallback callback,
     std::optional<Position> fragmentEndPosition = std::nullopt,
+    AstStatBlock* recentParse = nullptr,
     IFragmentAutocompleteReporter* reporter = nullptr
 );
 

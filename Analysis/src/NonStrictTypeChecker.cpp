@@ -2,6 +2,7 @@
 #include "Luau/NonStrictTypeChecker.h"
 
 #include "Luau/Ast.h"
+#include "Luau/AstQuery.h"
 #include "Luau/Common.h"
 #include "Luau/Simplify.h"
 #include "Luau/Type.h"
@@ -19,10 +20,12 @@
 #include <iostream>
 #include <iterator>
 
-LUAU_FASTFLAG(LuauFreeTypesMustHaveBounds)
+LUAU_FASTFLAG(DebugLuauMagicTypes)
+
 LUAU_FASTFLAGVARIABLE(LuauNonStrictVisitorImprovements)
 LUAU_FASTFLAGVARIABLE(LuauNewNonStrictWarnOnUnknownGlobals)
-LUAU_FASTFLAGVARIABLE(LuauNonStrictFuncDefErrorFix)
+LUAU_FASTFLAGVARIABLE(LuauNewNonStrictVisitTypes2)
+LUAU_FASTFLAG(LuauStoreReturnTypesAsPackOnAst)
 
 namespace Luau
 {
@@ -214,7 +217,7 @@ struct NonStrictTypeChecker
             return *fst;
         else if (auto ftp = get<FreeTypePack>(pack))
         {
-            TypeId result = FFlag::LuauFreeTypesMustHaveBounds ? arena->freshType(builtinTypes, ftp->scope) : arena->addType(FreeType{ftp->scope});
+            TypeId result = arena->freshType(builtinTypes, ftp->scope);
             TypePackId freeTail = arena->addTypePack(FreeTypePack{ftp->scope});
 
             TypePack* resultPack = emplaceTypePack<TypePack>(asMutable(pack));
@@ -308,7 +311,7 @@ struct NonStrictTypeChecker
             return visit(s);
         else if (auto s = stat->as<AstStatDeclareGlobal>())
             return visit(s);
-        else if (auto s = stat->as<AstStatDeclareClass>())
+        else if (auto s = stat->as<AstStatDeclareExternType>())
             return visit(s);
         else if (auto s = stat->as<AstStatError>())
             return visit(s);
@@ -334,7 +337,12 @@ struct NonStrictTypeChecker
                 // local x ; B generates the context of B without x
                 visit(local);
                 for (auto local : local->vars)
+                {
                     ctx.remove(dfg->getDef(local));
+
+                    if (FFlag::LuauNewNonStrictVisitTypes2)
+                        visit(local->annotation);
+                }
             }
             else
                 ctx = NonStrictContext::disjunction(builtinTypes, arena, visit(stat), ctx);
@@ -419,6 +427,9 @@ struct NonStrictTypeChecker
 
     NonStrictContext visit(AstStatFor* forStatement)
     {
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+            visit(forStatement->var->annotation);
+
         if (FFlag::LuauNonStrictVisitorImprovements)
         {
             // TODO: throwing out context based on same principle as existing code?
@@ -438,6 +449,12 @@ struct NonStrictTypeChecker
 
     NonStrictContext visit(AstStatForIn* forInStatement)
     {
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+        {
+            for (auto var : forInStatement->vars)
+                visit(var->annotation);
+        }
+
         if (FFlag::LuauNonStrictVisitorImprovements)
         {
             for (AstExpr* rhs : forInStatement->values)
@@ -486,6 +503,12 @@ struct NonStrictTypeChecker
 
     NonStrictContext visit(AstStatTypeAlias* typeAlias)
     {
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+        {
+            visitGenerics(typeAlias->generics, typeAlias->genericPacks);
+            visit(typeAlias->type);
+        }
+
         return {};
     }
 
@@ -496,16 +519,38 @@ struct NonStrictTypeChecker
 
     NonStrictContext visit(AstStatDeclareFunction* declFn)
     {
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+        {
+            visitGenerics(declFn->generics, declFn->genericPacks);
+            visit(declFn->params);
+            visit(declFn->retTypes);
+        }
+
         return {};
     }
 
     NonStrictContext visit(AstStatDeclareGlobal* declGlobal)
     {
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+            visit(declGlobal->type);
+
         return {};
     }
 
-    NonStrictContext visit(AstStatDeclareClass* declClass)
+    NonStrictContext visit(AstStatDeclareExternType* declClass)
     {
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+        {
+            if (declClass->indexer)
+            {
+                visit(declClass->indexer->indexType);
+                visit(declClass->indexer->resultType);
+            }
+
+            for (auto prop : declClass->props)
+                visit(prop.ty);
+        }
+
         return {};
     }
 
@@ -765,18 +810,31 @@ struct NonStrictTypeChecker
         {
             if (std::optional<TypeId> ty = willRunTimeErrorFunctionDefinition(local, remainder))
             {
-                if (FFlag::LuauNonStrictFuncDefErrorFix)
-                {
-                    const char* debugname = exprFn->debugname.value;
-                    reportError(NonStrictFunctionDefinitionError{debugname ? debugname : "", local->name.value, *ty}, local->location);
-                }
-                else
-                {
-                    reportError(NonStrictFunctionDefinitionError{exprFn->debugname.value, local->name.value, *ty}, local->location);
-                }
+                const char* debugname = exprFn->debugname.value;
+                reportError(NonStrictFunctionDefinitionError{debugname ? debugname : "", local->name.value, *ty}, local->location);
             }
             remainder.remove(dfg->getDef(local));
+
+            if (FFlag::LuauNewNonStrictVisitTypes2)
+                visit(local->annotation);
         }
+
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+        {
+            visitGenerics(exprFn->generics, exprFn->genericPacks);
+
+            if (FFlag::LuauStoreReturnTypesAsPackOnAst)
+                visit(exprFn->returnAnnotation);
+            else
+            {
+                if (exprFn->returnAnnotation_DEPRECATED)
+                    visit(*exprFn->returnAnnotation_DEPRECATED);
+            }
+
+            if (exprFn->varargAnnotation)
+                visit(exprFn->varargAnnotation);
+        }
+
         return remainder;
     }
 
@@ -817,6 +875,9 @@ struct NonStrictTypeChecker
 
     NonStrictContext visit(AstExprTypeAssertion* typeAssertion)
     {
+        if (FFlag::LuauNewNonStrictVisitTypes2)
+            visit(typeAssertion->annotation);
+
         if (FFlag::LuauNonStrictVisitorImprovements)
             return visit(typeAssertion->expr, ValueContext::RValue);
         else
@@ -850,6 +911,331 @@ struct NonStrictTypeChecker
                 visit(expr, ValueContext::RValue);
         }
 
+        return {};
+    }
+
+    void visit(AstType* ty)
+    {
+        LUAU_ASSERT(FFlag::LuauNewNonStrictVisitTypes2);
+
+        // If this node is `nullptr`, early exit.
+        if (!ty)
+            return;
+
+        if (auto t = ty->as<AstTypeReference>())
+            return visit(t);
+        else if (auto t = ty->as<AstTypeTable>())
+            return visit(t);
+        else if (auto t = ty->as<AstTypeFunction>())
+            return visit(t);
+        else if (auto t = ty->as<AstTypeTypeof>())
+            return visit(t);
+        else if (auto t = ty->as<AstTypeUnion>())
+            return visit(t);
+        else if (auto t = ty->as<AstTypeIntersection>())
+            return visit(t);
+        else if (auto t = ty->as<AstTypeGroup>())
+            return visit(t->type);
+    }
+
+    void visit(AstTypeReference* ty)
+    {
+        // No further validation is necessary in this case. The main logic for
+        // _luau_print is contained in lookupAnnotation.
+        if (FFlag::DebugLuauMagicTypes && ty->name == "_luau_print")
+            return;
+
+        for (const AstTypeOrPack& param : ty->parameters)
+        {
+            if (param.type)
+                visit(param.type);
+            else
+                visit(param.typePack);
+        }
+
+        Scope* scope = findInnermostScope(ty->location);
+        LUAU_ASSERT(scope);
+
+        std::optional<TypeFun> alias = ty->prefix ? scope->lookupImportedType(ty->prefix->value, ty->name.value) : scope->lookupType(ty->name.value);
+
+        if (alias.has_value())
+        {
+            size_t typesRequired = alias->typeParams.size();
+            size_t packsRequired = alias->typePackParams.size();
+
+            bool hasDefaultTypes = std::any_of(
+                alias->typeParams.begin(),
+                alias->typeParams.end(),
+                [](auto&& el)
+                {
+                    return el.defaultValue.has_value();
+                }
+            );
+
+            bool hasDefaultPacks = std::any_of(
+                alias->typePackParams.begin(),
+                alias->typePackParams.end(),
+                [](auto&& el)
+                {
+                    return el.defaultValue.has_value();
+                }
+            );
+
+            if (!ty->hasParameterList)
+            {
+                if ((!alias->typeParams.empty() && !hasDefaultTypes) || (!alias->typePackParams.empty() && !hasDefaultPacks))
+                    reportError(GenericError{"Type parameter list is required"}, ty->location);
+            }
+
+            size_t typesProvided = 0;
+            size_t extraTypes = 0;
+            size_t packsProvided = 0;
+
+            for (const AstTypeOrPack& p : ty->parameters)
+            {
+                if (p.type)
+                {
+                    if (packsProvided != 0)
+                    {
+                        reportError(GenericError{"Type parameters must come before type pack parameters"}, ty->location);
+                        continue;
+                    }
+
+                    if (typesProvided < typesRequired)
+                        typesProvided += 1;
+                    else
+                        extraTypes += 1;
+                }
+                else if (p.typePack)
+                {
+                    std::optional<TypePackId> tp = lookupPackAnnotation(p.typePack);
+                    if (!tp.has_value())
+                        continue;
+
+                    if (typesProvided < typesRequired && size(*tp) == 1 && finite(*tp) && first(*tp))
+                        typesProvided += 1;
+                    else
+                        packsProvided += 1;
+                }
+            }
+
+            if (extraTypes != 0 && packsProvided == 0)
+            {
+                // Extra types are only collected into a pack if a pack is expected
+                if (packsRequired != 0)
+                    packsProvided += 1;
+                else
+                    typesProvided += extraTypes;
+            }
+
+            for (size_t i = typesProvided; i < typesRequired; ++i)
+            {
+                if (alias->typeParams[i].defaultValue)
+                    typesProvided += 1;
+            }
+
+            for (size_t i = packsProvided; i < packsRequired; ++i)
+            {
+                if (alias->typePackParams[i].defaultValue)
+                    packsProvided += 1;
+            }
+
+            if (extraTypes == 0 && packsProvided + 1 == packsRequired)
+                packsProvided += 1;
+
+
+            if (typesProvided != typesRequired || packsProvided != packsRequired)
+            {
+                reportError(
+                    IncorrectGenericParameterCount{
+                        /* name */ ty->name.value,
+                        /* typeFun */ *alias,
+                        /* actualParameters */ typesProvided,
+                        /* actualPackParameters */ packsProvided,
+                    },
+                    ty->location
+                );
+            }
+        }
+        else
+        {
+            if (scope->lookupPack(ty->name.value))
+            {
+                reportError(
+                    SwappedGenericTypeParameter{
+                        ty->name.value,
+                        SwappedGenericTypeParameter::Kind::Type,
+                    },
+                    ty->location
+                );
+            }
+            else
+            {
+                std::string symbol = "";
+                if (ty->prefix)
+                {
+                    symbol += (*(ty->prefix)).value;
+                    symbol += ".";
+                }
+                symbol += ty->name.value;
+
+                reportError(UnknownSymbol{symbol, UnknownSymbol::Context::Type}, ty->location);
+            }
+        }
+    }
+
+    void visit(AstTypeTable* table)
+    {
+        if (table->indexer)
+        {
+            visit(table->indexer->indexType);
+            visit(table->indexer->resultType);
+        }
+
+        for (auto prop : table->props)
+            visit(prop.type);
+    }
+
+    void visit(AstTypeFunction* function)
+    {
+        visit(function->argTypes);
+        visit(function->returnTypes);
+    }
+
+    void visit(AstTypeTypeof* typeOf)
+    {
+        visit(typeOf->expr, ValueContext::RValue);
+    }
+
+    void visit(AstTypeUnion* unionType)
+    {
+        for (auto typ : unionType->types)
+            visit(typ);
+    }
+
+    void visit(AstTypeIntersection* intersectionType)
+    {
+        for (auto typ : intersectionType->types)
+            visit(typ);
+    }
+
+    void visit(AstTypeList& list)
+    {
+        for (auto typ : list.types)
+            visit(typ);
+        if (list.tailType)
+            visit(list.tailType);
+    }
+
+    void visit(AstTypePack* pack)
+    {
+        LUAU_ASSERT(FFlag::LuauNewNonStrictVisitTypes2);
+
+        // If there is no pack node, early exit.
+        if (!pack)
+            return;
+
+        if (auto p = pack->as<AstTypePackExplicit>())
+            return visit(p);
+        else if (auto p = pack->as<AstTypePackVariadic>())
+            return visit(p);
+        else if (auto p = pack->as<AstTypePackGeneric>())
+            return visit(p);
+    }
+
+    void visit(AstTypePackExplicit* tp)
+    {
+        for (AstType* type : tp->typeList.types)
+            visit(type);
+
+        if (tp->typeList.tailType)
+            visit(tp->typeList.tailType);
+    }
+
+    void visit(AstTypePackVariadic* tp)
+    {
+        visit(tp->variadicType);
+    }
+
+    void visit(AstTypePackGeneric* tp)
+    {
+        Scope* scope = findInnermostScope(tp->location);
+        LUAU_ASSERT(scope);
+
+        std::optional<TypePackId> alias = scope->lookupPack(tp->genericName.value);
+        if (!alias.has_value())
+        {
+            if (scope->lookupType(tp->genericName.value))
+            {
+                reportError(
+                    SwappedGenericTypeParameter{
+                        tp->genericName.value,
+                        SwappedGenericTypeParameter::Kind::Pack,
+                    },
+                    tp->location
+                );
+            }
+        }
+        else
+        {
+            reportError(UnknownSymbol{tp->genericName.value, UnknownSymbol::Context::Type}, tp->location);
+        }
+    }
+
+    void visitGenerics(AstArray<AstGenericType*> generics, AstArray<AstGenericTypePack*> genericPacks)
+    {
+        DenseHashSet<AstName> seen{AstName{}};
+
+        for (const auto* g : generics)
+        {
+            if (seen.contains(g->name))
+                reportError(DuplicateGenericParameter{g->name.value}, g->location);
+            else
+                seen.insert(g->name);
+
+            if (g->defaultValue)
+                visit(g->defaultValue);
+        }
+
+        for (const auto* g : genericPacks)
+        {
+            if (seen.contains(g->name))
+                reportError(DuplicateGenericParameter{g->name.value}, g->location);
+            else
+                seen.insert(g->name);
+
+            if (g->defaultValue)
+                visit(g->defaultValue);
+        }
+    }
+
+    Scope* findInnermostScope(Location location) const
+    {
+        Scope* bestScope = module->getModuleScope().get();
+
+        bool didNarrow;
+        do
+        {
+            didNarrow = false;
+            for (auto scope : bestScope->children)
+            {
+                if (scope->location.encloses(location))
+                {
+                    bestScope = scope.get();
+                    didNarrow = true;
+                    break;
+                }
+            }
+        } while (didNarrow && bestScope->children.size() > 0);
+
+        return bestScope;
+    }
+
+    std::optional<TypePackId> lookupPackAnnotation(AstTypePack* annotation) const
+    {
+        TypePackId* tp = module->astResolvedTypePacks.find(annotation);
+        if (tp != nullptr)
+            return {follow(*tp)};
         return {};
     }
 

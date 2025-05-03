@@ -38,7 +38,8 @@ CstExprIndexExpr::CstExprIndexExpr(Position openBracketPosition, Position closeB
 {
 }
 
-CstExprFunction::CstExprFunction() : CstNode(CstClassIndex())
+CstExprFunction::CstExprFunction()
+    : CstNode(CstClassIndex())
 {
 }
 
@@ -129,8 +130,15 @@ CstStatCompoundAssign::CstStatCompoundAssign(Position opPosition)
 {
 }
 
-CstStatLocalFunction::CstStatLocalFunction(Position functionKeywordPosition)
+CstStatFunction::CstStatFunction(Position functionKeywordPosition)
     : CstNode(CstClassIndex())
+    , functionKeywordPosition(functionKeywordPosition)
+{
+}
+
+CstStatLocalFunction::CstStatLocalFunction(Position localKeywordPosition, Position functionKeywordPosition)
+    : CstNode(CstClassIndex())
+    , localKeywordPosition(localKeywordPosition)
     , functionKeywordPosition(functionKeywordPosition)
 {
 }
@@ -221,6 +229,20 @@ CstTypeTypeof::CstTypeTypeof(Position openPosition, Position closePosition)
 {
 }
 
+CstTypeUnion::CstTypeUnion(std::optional<Position> leadingPosition, AstArray<Position> separatorPositions)
+    : CstNode(CstClassIndex())
+    , leadingPosition(leadingPosition)
+    , separatorPositions(separatorPositions)
+{
+}
+
+CstTypeIntersection::CstTypeIntersection(std::optional<Position> leadingPosition, AstArray<Position> separatorPositions)
+    : CstNode(CstClassIndex())
+    , leadingPosition(leadingPosition)
+    , separatorPositions(separatorPositions)
+{
+}
+
 CstTypeSingletonString::CstTypeSingletonString(AstArray<char> sourceString, CstExprConstantString::QuoteStyle quoteStyle, unsigned int blockDepth)
     : CstNode(CstClassIndex())
     , sourceString(sourceString)
@@ -230,8 +252,18 @@ CstTypeSingletonString::CstTypeSingletonString(AstArray<char> sourceString, CstE
     LUAU_ASSERT(quoteStyle != CstExprConstantString::QuotedInterp);
 }
 
+CstTypePackExplicit::CstTypePackExplicit()
+    : CstNode(CstClassIndex())
+    , hasParentheses(false)
+    , openParenthesesPosition(Position{0, 0})
+    , closeParenthesesPosition(Position{0, 0})
+    , commaPositions({})
+{
+}
+
 CstTypePackExplicit::CstTypePackExplicit(Position openParenthesesPosition, Position closeParenthesesPosition, AstArray<Position> commaPositions)
     : CstNode(CstClassIndex())
+    , hasParentheses(true)
     , openParenthesesPosition(openParenthesesPosition)
     , closeParenthesesPosition(closeParenthesesPosition)
     , commaPositions(commaPositions)

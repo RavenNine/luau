@@ -6,7 +6,7 @@
 
 #include <stdexcept>
 
-LUAU_FASTFLAG(LuauSolverV2);
+LUAU_FASTFLAGVARIABLE(LuauTypePackDetectCycles)
 
 namespace Luau
 {
@@ -18,10 +18,11 @@ FreeTypePack::FreeTypePack(TypeLevel level)
 {
 }
 
-FreeTypePack::FreeTypePack(Scope* scope)
+FreeTypePack::FreeTypePack(Scope* scope, Polarity polarity)
     : index(Unifiable::freshIndex())
     , level{}
     , scope(scope)
+    , polarity(polarity)
 {
 }
 
@@ -52,9 +53,10 @@ GenericTypePack::GenericTypePack(const Name& name)
 {
 }
 
-GenericTypePack::GenericTypePack(Scope* scope)
+GenericTypePack::GenericTypePack(Scope* scope, Polarity polarity)
     : index(Unifiable::freshIndex())
     , scope(scope)
+    , polarity(polarity)
 {
 }
 
@@ -147,6 +149,15 @@ TypePackIterator& TypePackIterator::operator++()
         currentTypePack = tp->tail ? log->follow(*tp->tail) : nullptr;
         tp = currentTypePack ? log->getMutable<TypePack>(currentTypePack) : nullptr;
 
+        if (FFlag::LuauTypePackDetectCycles && tp)
+        {
+            // Step twice on each iteration to detect cycles
+            tailCycleCheck = tp->tail ? log->follow(*tp->tail) : nullptr;
+
+            if (currentTypePack == tailCycleCheck)
+                throw InternalCompilerError("TypePackIterator detected a type pack cycle");
+        }
+
         currentIndex = 0;
     }
 
@@ -195,6 +206,26 @@ TypePackIterator begin(TypePackId tp, const TxnLog* log)
 TypePackIterator end(TypePackId tp)
 {
     return TypePackIterator{};
+}
+
+TypePackId getTail(TypePackId tp)
+{
+    DenseHashSet<TypePackId> seen{nullptr};
+    while (tp)
+    {
+        tp = follow(tp);
+
+        if (seen.contains(tp))
+            break;
+        seen.insert(tp);
+
+        if (auto pack = get<TypePack>(tp); pack && pack->tail)
+            tp = *pack->tail;
+        else
+            break;
+    }
+
+    return follow(tp);
 }
 
 bool areEqual(SeenSet& seen, const TypePackVar& lhs, const TypePackVar& rhs)

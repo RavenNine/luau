@@ -179,8 +179,6 @@ public:
             generic->scope = nullptr;
         else if (auto free = getMutable<FreeType>(target))
             free->scope = nullptr;
-        else if (auto fn = getMutable<FunctionType>(target))
-            fn->scope = nullptr;
         else if (auto table = getMutable<TableType>(target))
             table->scope = nullptr;
 
@@ -357,7 +355,7 @@ private:
         t->metatable = shallowClone(t->metatable);
     }
 
-    void cloneChildren(ClassType* t)
+    void cloneChildren(ExternType* t)
     {
         for (auto& [_, p] : t->props)
             p = shallowClone(p);
@@ -520,11 +518,6 @@ public:
         {
             if (FFlag::LuauClonedTableAndFunctionTypesMustHaveScopes)
                 tt->scope = replacementForNullScope;
-        }
-        else if (auto fn = getMutable<FunctionType>(target))
-        {
-            if (FFlag::LuauClonedTableAndFunctionTypesMustHaveScopes)
-                fn->scope = replacementForNullScope;
         }
 
         (*types)[ty] = target;

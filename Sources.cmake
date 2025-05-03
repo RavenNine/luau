@@ -169,7 +169,6 @@ target_sources(Luau.CodeGen PRIVATE
 # Luau.Analysis Sources
 target_sources(Luau.Analysis PRIVATE
     Analysis/include/Luau/Anyification.h
-    Analysis/include/Luau/AnyTypeSummary.h
     Analysis/include/Luau/ApplyTypeFunction.h
     Analysis/include/Luau/AstJsonEncoder.h
     Analysis/include/Luau/AstQuery.h
@@ -180,6 +179,7 @@ target_sources(Luau.Analysis PRIVATE
     Analysis/include/Luau/Clone.h
     Analysis/include/Luau/Constraint.h
     Analysis/include/Luau/ConstraintGenerator.h
+    Analysis/include/Luau/ConstraintSet.h
     Analysis/include/Luau/ConstraintSolver.h
     Analysis/include/Luau/ControlFlow.h
     Analysis/include/Luau/DataFlowGraph.h
@@ -194,6 +194,7 @@ target_sources(Luau.Analysis PRIVATE
     Analysis/include/Luau/Frontend.h
     Analysis/include/Luau/Generalization.h
     Analysis/include/Luau/GlobalTypes.h
+    Analysis/include/Luau/InferPolarity.h
     Analysis/include/Luau/InsertionOrderedMap.h
     Analysis/include/Luau/Instantiation.h
     Analysis/include/Luau/Instantiation2.h
@@ -207,6 +208,7 @@ target_sources(Luau.Analysis PRIVATE
     Analysis/include/Luau/NonStrictTypeChecker.h
     Analysis/include/Luau/Normalize.h
     Analysis/include/Luau/OverloadResolution.h
+    Analysis/include/Luau/Polarity.h
     Analysis/include/Luau/Predicate.h
     Analysis/include/Luau/Quantify.h
     Analysis/include/Luau/RecursionCounter.h
@@ -248,7 +250,6 @@ target_sources(Luau.Analysis PRIVATE
     Analysis/include/Luau/VisitType.h
 
     Analysis/src/Anyification.cpp
-    Analysis/src/AnyTypeSummary.cpp
     Analysis/src/ApplyTypeFunction.cpp
     Analysis/src/AstJsonEncoder.cpp
     Analysis/src/AstQuery.cpp
@@ -271,6 +272,7 @@ target_sources(Luau.Analysis PRIVATE
     Analysis/src/Frontend.cpp
     Analysis/src/Generalization.cpp
     Analysis/src/GlobalTypes.cpp
+    Analysis/src/InferPolarity.cpp
     Analysis/src/Instantiation.cpp
     Analysis/src/Instantiation2.cpp
     Analysis/src/IostreamHelpers.cpp
@@ -396,11 +398,9 @@ target_sources(isocline PRIVATE
 target_sources(Luau.CLI.lib PRIVATE
     CLI/include/Luau/FileUtils.h
     CLI/include/Luau/Flags.h
-    CLI/include/Luau/Require.h
 
     CLI/src/FileUtils.cpp
     CLI/src/Flags.cpp
-    CLI/src/Require.cpp
 )
 
 if(TARGET Luau.Repl.CLI)
@@ -408,18 +408,27 @@ if(TARGET Luau.Repl.CLI)
     target_sources(Luau.Repl.CLI PRIVATE
         CLI/include/Luau/Coverage.h
         CLI/include/Luau/Profiler.h
+        CLI/include/Luau/ReplRequirer.h
+        CLI/include/Luau/RequirerUtils.h
 
         CLI/src/Coverage.cpp
         CLI/src/Profiler.cpp
         CLI/src/Repl.cpp
         CLI/src/ReplEntry.cpp
+        CLI/src/ReplRequirer.cpp
+        CLI/src/RequirerUtils.cpp
     )
 endif()
 
 if(TARGET Luau.Analyze.CLI)
     # Luau.Analyze.CLI Sources
     target_sources(Luau.Analyze.CLI PRIVATE
+        CLI/include/Luau/AnalyzeRequirer.h
+        CLI/include/Luau/RequirerUtils.h
+
         CLI/src/Analyze.cpp
+        CLI/src/AnalyzeRequirer.cpp
+        CLI/src/RequirerUtils.cpp
     )
 endif()
 
@@ -433,7 +442,6 @@ endif()
 if(TARGET Luau.UnitTest)
     # Luau.UnitTest Sources
     target_sources(Luau.UnitTest PRIVATE
-        tests/AnyTypeSummary.test.cpp
         tests/AssemblyBuilderA64.test.cpp
         tests/AssemblyBuilderX64.test.cpp
         tests/AstJsonEncoder.test.cpp
@@ -464,9 +472,10 @@ if(TARGET Luau.UnitTest)
         tests/Error.test.cpp
         tests/Fixture.cpp
         tests/Fixture.h
-	tests/FragmentAutocomplete.test.cpp
+        tests/FragmentAutocomplete.test.cpp
         tests/Frontend.test.cpp
         tests/Generalization.test.cpp
+        tests/InferPolarity.test.cpp
         tests/InsertionOrderedMap.test.cpp
         tests/Instantiation2.test.cpp
         tests/IostreamOptional.h
@@ -553,16 +562,43 @@ if(TARGET Luau.CLI.Test)
     target_sources(Luau.CLI.Test PRIVATE
         CLI/include/Luau/Coverage.h
         CLI/include/Luau/Profiler.h
+        CLI/include/Luau/ReplRequirer.h
+        CLI/include/Luau/RequirerUtils.h
 
         CLI/src/Coverage.cpp
         CLI/src/Profiler.cpp
         CLI/src/Repl.cpp
+        CLI/src/ReplRequirer.cpp
+        CLI/src/RequirerUtils.cpp
 
         tests/RegisterCallbacks.h
         tests/RegisterCallbacks.cpp
         tests/Repl.test.cpp
         tests/RequireByString.test.cpp
         tests/main.cpp)
+endif()
+
+if(TARGET Luau.Require)
+    # Luau.Require Sources
+    target_sources(Luau.Require PRIVATE
+        Require/Runtime/include/Luau/Require.h
+
+        Require/Runtime/src/Navigation.h
+        Require/Runtime/src/RequireImpl.h
+
+        Require/Runtime/src/Navigation.cpp
+        Require/Runtime/src/Require.cpp
+        Require/Runtime/src/RequireImpl.cpp)
+endif()
+
+if(TARGET Luau.RequireNavigator)
+    # Luau.Require Sources
+    target_sources(Luau.RequireNavigator PRIVATE
+        Require/Navigator/include/Luau/PathUtilities.h
+        Require/Navigator/include/Luau/RequireNavigator.h
+
+        Require/Navigator/src/PathUtilities.cpp
+        Require/Navigator/src/RequireNavigator.cpp)
 endif()
 
 if(TARGET Luau.Web)

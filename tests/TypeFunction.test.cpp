@@ -17,7 +17,12 @@ LUAU_FASTFLAG(LuauIndexTypeFunctionImprovements)
 LUAU_DYNAMIC_FASTINT(LuauTypeFamilyApplicationCartesianProductLimit)
 LUAU_FASTFLAG(LuauIndexTypeFunctionFunctionMetamethods)
 LUAU_FASTFLAG(LuauMetatableTypeFunctions)
+LUAU_FASTFLAG(LuauMetatablesHaveLength)
+LUAU_FASTFLAG(DebugLuauGreedyGeneralization)
 LUAU_FASTFLAG(LuauIndexAnyIsAny)
+LUAU_FASTFLAG(LuauNewTypeFunReductionChecks2)
+LUAU_FASTFLAG(LuauHasPropProperBlock)
+LUAU_FASTFLAG(LuauFixCyclicIndexInIndexer)
 
 struct TypeFunctionFixture : Fixture
 {
@@ -145,19 +150,17 @@ TEST_CASE_FIXTURE(TypeFunctionFixture, "unsolvable_function")
     if (!FFlag::LuauSolverV2)
         return;
 
+    ScopedFastFlag luauNewTypeFunReductionChecks2{FFlag::LuauNewTypeFunReductionChecks2, true};
+
     CheckResult result = check(R"(
         local impossible: <T>(Swap<T>) -> Swap<Swap<T>>
         local a = impossible(123)
         local b = impossible(true)
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(6, result);
-    CHECK(toString(result.errors[0]) == "Type function instance Swap<Swap<T>> is uninhabited");
-    CHECK(toString(result.errors[1]) == "Type function instance Swap<T> is uninhabited");
-    CHECK(toString(result.errors[2]) == "Type function instance Swap<Swap<T>> is uninhabited");
-    CHECK(toString(result.errors[3]) == "Type function instance Swap<T> is uninhabited");
-    CHECK(toString(result.errors[4]) == "Type function instance Swap<Swap<T>> is uninhabited");
-    CHECK(toString(result.errors[5]) == "Type function instance Swap<T> is uninhabited");
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
+    CHECK(toString(result.errors[0]) == "Type 'number' could not be converted into 'never'");
+    CHECK(toString(result.errors[1]) == "Type 'boolean' could not be converted into 'never'");
 }
 
 TEST_CASE_FIXTURE(TypeFunctionFixture, "table_internal_functions")
@@ -590,7 +593,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "rawkeyof_type_function_never_for_empty_table
     CHECK(toString(requireType("foo")) == "never");
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_works_on_classes")
+TEST_CASE_FIXTURE(ExternTypeFixture, "keyof_type_function_works_on_extern_types")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -610,7 +613,7 @@ TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_works_on_classes")
     CHECK_EQ("\"BaseField\" | \"BaseMethod\" | \"Touched\"", toString(tpm->givenTp));
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_errors_if_it_has_nonclass_part")
+TEST_CASE_FIXTURE(ExternTypeFixture, "keyof_type_function_errors_if_it_has_nonclass_part")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -627,7 +630,7 @@ TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_errors_if_it_has_nonclass_p
     CHECK(toString(result.errors[1]) == "Type 'BaseClass | boolean' does not have keys, so 'keyof<BaseClass | boolean>' is invalid");
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_common_subset_if_union_of_differing_classes")
+TEST_CASE_FIXTURE(ExternTypeFixture, "keyof_type_function_common_subset_if_union_of_differing_extern_types")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -641,7 +644,7 @@ TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_common_subset_if_union_of_d
     LUAU_REQUIRE_NO_ERRORS(result);
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_works_with_parent_classes_too")
+TEST_CASE_FIXTURE(ExternTypeFixture, "keyof_type_function_works_with_parent_extern_types_too")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -655,7 +658,7 @@ TEST_CASE_FIXTURE(ClassFixture, "keyof_type_function_works_with_parent_classes_t
     LUAU_REQUIRE_NO_ERRORS(result);
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "binary_type_function_works_with_default_argument")
+TEST_CASE_FIXTURE(ExternTypeFixture, "binary_type_function_works_with_default_argument")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -670,7 +673,7 @@ TEST_CASE_FIXTURE(ClassFixture, "binary_type_function_works_with_default_argumen
     CHECK("() -> number" == toString(requireType("thunk")));
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "vector2_multiply_is_overloaded")
+TEST_CASE_FIXTURE(ExternTypeFixture, "vector2_multiply_is_overloaded")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -922,6 +925,79 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "index_of_any_is_any")
     CHECK(toString(requireTypeAlias("T")) == "any");
 }
 
+TEST_CASE_FIXTURE(BuiltinsFixture, "index_should_not_crash_on_cyclic_stuff")
+{
+    if (!FFlag::LuauSolverV2)
+        return;
+
+    ScopedFastFlag sff{FFlag::LuauFixCyclicIndexInIndexer, true};
+
+    CheckResult result = check(R"(
+        local PlayerData = {}
+
+        type Keys = index<typeof(PlayerData), true>
+
+        local function UpdateData(key: Keys)
+            PlayerData[key] = 4
+        end
+    )");
+
+    LUAU_REQUIRE_ERRORS(result);
+    CHECK(toString(requireTypeAlias("Keys")) == "index<PlayerData, true>");
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "index_should_not_crash_on_cyclic_stuff2")
+{
+    if (!FFlag::LuauSolverV2)
+        return;
+
+    ScopedFastFlag sff{FFlag::LuauFixCyclicIndexInIndexer, true};
+
+    CheckResult result = check(R"(
+        local PlayerData = {}
+
+        type Keys = index<typeof(PlayerData), number>
+
+        local function UpdateData(key: Keys)
+            PlayerData[key] = 4
+        end
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+    CHECK(toString(requireTypeAlias("Keys")) == "number");
+}
+
+#if 0
+// CLI-148701
+TEST_CASE_FIXTURE(BuiltinsFixture, "index_should_not_crash_on_cyclic_stuff3")
+{
+    if (!FFlag::LuauSolverV2)
+        return;
+
+    ScopedFastFlag sff{FFlag::LuauFixCyclicIndexInIndexer, true};
+
+    CheckResult result = check(R"(
+        local PlayerData = {
+            Coins = 0,
+            Level = 1,
+            Exp = 0,
+            MapExp = 100,
+        }
+
+        type Keys = index<typeof(PlayerData), true>
+
+        local function UpdateData(key: Keys, value)
+            PlayerData[key] = value
+        end
+
+        UpdateData("Coins", 2)
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+    CHECK(toString(requireTypeAlias("Keys")) == "unknown");
+}
+#endif
+
 TEST_CASE_FIXTURE(BuiltinsFixture, "index_type_function_works")
 {
     if (!FFlag::LuauSolverV2)
@@ -1051,8 +1127,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "index_type_function_works_on_function_metame
     if (!FFlag::LuauSolverV2)
         return;
 
-    ScopedFastFlag sff[]
-    {
+    ScopedFastFlag sff[]{
         {FFlag::LuauIndexTypeFunctionFunctionMetamethods, true},
         {FFlag::LuauIndexTypeFunctionImprovements, true},
     };
@@ -1080,8 +1155,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "index_type_function_works_on_function_metame
     if (!FFlag::LuauSolverV2)
         return;
 
-    ScopedFastFlag sff[]
-    {
+    ScopedFastFlag sff[]{
         {FFlag::LuauIndexTypeFunctionFunctionMetamethods, true},
         {FFlag::LuauIndexTypeFunctionImprovements, true},
     };
@@ -1164,7 +1238,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "index_type_function_rfc_alternative_section"
         type MyObject = {a: string}
         type MyObject2 = {a: string, b: number}
 
-        local function edgeCase(param: MyObject) 
+        local function edgeCase(param: MyObject)
             type unknownType = index<typeof(param), "b">
         end
     )");
@@ -1173,7 +1247,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "index_type_function_rfc_alternative_section"
     CHECK(toString(result.errors[0]) == "Property '\"b\"' does not exist on type 'MyObject'");
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "index_type_function_works_on_classes")
+TEST_CASE_FIXTURE(ExternTypeFixture, "index_type_function_works_on_extern_types")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -1187,7 +1261,7 @@ TEST_CASE_FIXTURE(ClassFixture, "index_type_function_works_on_classes")
     LUAU_REQUIRE_NO_ERRORS(result);
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "index_type_function_works_on_classes_with_parents")
+TEST_CASE_FIXTURE(ExternTypeFixture, "index_type_function_works_on_extern_types_with_parents")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -1332,7 +1406,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "rawget_type_function_works_w_index_metatable
     CHECK(toString(result.errors[1]) == "Property '\"Bar\" | \"Foo\"' does not exist on type 'exampleClass3'");
 }
 
-TEST_CASE_FIXTURE(ClassFixture, "rawget_type_function_errors_w_classes")
+TEST_CASE_FIXTURE(ExternTypeFixture, "rawget_type_function_errors_w_extern_types")
 {
     if (!FFlag::LuauSolverV2)
         return;
@@ -1550,6 +1624,121 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "getmetatable_respects_metatable_metamethod")
     LUAU_REQUIRE_NO_ERRORS(result);
 
     CHECK_EQ(toString(requireTypeAlias("Metatable")), "string");
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "type_function_correct_cycle_check")
+{
+    if (!FFlag::LuauSolverV2)
+        return;
+
+    ScopedFastFlag luauNewTypeFunReductionChecks2{FFlag::LuauNewTypeFunReductionChecks2, true};
+
+    CheckResult result = check(R"(
+type foo<T> = { a: add<T, T>, b : add<T, T> }
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "len_typefun_on_metatable")
+{
+    ScopedFastFlag newSolver{FFlag::LuauSolverV2, true};
+    ScopedFastFlag luauMetatablesHaveLength{FFlag::LuauMetatablesHaveLength, true};
+
+    CheckResult result = check(R"(
+local t = setmetatable({}, { __mode = "v" })
+
+local function f()
+    table.insert(t, {})
+    print(#t * 100)
+end
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "has_prop_on_irreducible_type_function")
+{
+    ScopedFastFlag newSolver{FFlag::LuauSolverV2, true};
+    ScopedFastFlag luauHasPropProperBlock{FFlag::LuauHasPropProperBlock, true};
+
+    CheckResult result = check(R"(
+local test = "a" + "b"
+print(test.a)
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
+    CHECK(
+        "Operator '+' could not be applied to operands of types string and string; there is no corresponding overload for __add" ==
+        toString(result.errors[0])
+    );
+    CHECK("Type 'add<string, string>' does not have key 'a'" == toString(result.errors[1]));
+}
+
+struct TFFixture
+{
+    TypeArena arena_;
+    NotNull<TypeArena> arena{&arena_};
+
+    BuiltinTypes builtinTypes_;
+    NotNull<BuiltinTypes> builtinTypes{&builtinTypes_};
+
+    ScopePtr globalScope = std::make_shared<Scope>(builtinTypes->anyTypePack);
+
+    InternalErrorReporter ice;
+    UnifierSharedState unifierState{&ice};
+    SimplifierPtr simplifier = EqSatSimplification::newSimplifier(arena, builtinTypes);
+    Normalizer normalizer{arena, builtinTypes, NotNull{&unifierState}};
+    TypeCheckLimits limits;
+    TypeFunctionRuntime runtime{NotNull{&ice}, NotNull{&limits}};
+
+    const ScopedFastFlag sff[1] = {
+        {FFlag::DebugLuauGreedyGeneralization, true},
+    };
+
+    BuiltinTypeFunctions builtinTypeFunctions;
+
+    TypeFunctionContext tfc{
+        arena,
+        builtinTypes,
+        NotNull{globalScope.get()},
+        NotNull{simplifier.get()},
+        NotNull{&normalizer},
+        NotNull{&runtime},
+        NotNull{&ice},
+        NotNull{&limits}
+    };
+};
+
+TEST_CASE_FIXTURE(TFFixture, "refine<G, ~(false?)>")
+{
+    TypeId g = arena->addType(GenericType{globalScope.get(), Polarity::Negative});
+
+    TypeId refineTy = arena->addType(TypeFunctionInstanceType{
+        builtinTypeFunctions.refineFunc, {g, builtinTypes->truthyType}
+    });
+
+    FunctionGraphReductionResult res = reduceTypeFunctions(refineTy, Location{}, tfc);
+
+    CHECK(res.reducedTypes.size() == 1);
+
+    CHECK(res.errors.size() == 0);
+    CHECK(res.irreducibleTypes.size() == 0);
+    CHECK(res.blockedTypes.size() == 0);
+}
+
+TEST_CASE_FIXTURE(TFFixture, "or<'a, 'b>")
+{
+    TypeId aType = arena->freshType(builtinTypes, globalScope.get());
+    TypeId bType = arena->freshType(builtinTypes, globalScope.get());
+
+    TypeId orType = arena->addType(TypeFunctionInstanceType{
+        builtinTypeFunctions.orFunc, {aType, bType}
+    });
+
+    FunctionGraphReductionResult res = reduceTypeFunctions(orType, Location{}, tfc);
+
+    CHECK(res.reducedTypes.size() == 1);
 }
 
 TEST_SUITE_END();
